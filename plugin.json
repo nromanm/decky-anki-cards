@@ -1,7 +1,8 @@
 {
-  "name": "Example Plugin",
+  "name": "Anki Card Generator",
   "author": "John Doe",
   "flags": ["debug", "_root"],
+  "version": "0.0.1",
   "api_version": 1,
   "publish": {
     "tags": ["template", "root"],
