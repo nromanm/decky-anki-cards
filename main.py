@@ -60,6 +60,18 @@ def _build_media_entry(value: str, field_name: str):
     return entry
 
 class Plugin:
+    # Lightweight ping to check whether Anki + AnkiConnect are reachable right now. Swallows
+    # every error (connection refused, timeout, ...) and just reports false, since callers only
+    # care about the yes/no status, not the specific failure.
+    async def check_anki_connection(self) -> bool:
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(None, _ankiconnect_request, "version")
+            return True
+        except Exception as e:
+            decky.logger.info(f"check_anki_connection: not connected: {e}")
+            return False
+
     async def _ensure_deck_and_model(self, loop, deck_name: str) -> None:
         await loop.run_in_executor(None, _ankiconnect_request, "createDeck", {"deck": deck_name})
         existing_models = await loop.run_in_executor(None, _ankiconnect_request, "modelNames")

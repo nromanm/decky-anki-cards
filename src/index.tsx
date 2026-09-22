@@ -13,9 +13,10 @@ import {
   definePlugin,
   toaster,
 } from "@decky/api"
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { FaShip } from "react-icons/fa";
 
+const checkAnkiConnection = callable<[], boolean>("check_anki_connection");
 const createDeckForLanguage = callable<[language: string], string>("create_deck_for_language");
 const addNote = callable<[language: string, morph: string, definition: string, image: string, audio: string], number>("add_note");
 
@@ -27,6 +28,44 @@ const LANGUAGES = [
 ];
 
 const deckNameForLanguage = (language: string) => `Decky Anki Plugin Deck (${language})`;
+
+// Both a headless background launch and piggybacking on another game's Launch Options were
+// confirmed broken: Anki starts but hangs before AnkiConnect loads (likely stuck on a dialog,
+// since it's not a properly session-integrated app that way). The one thing confirmed to work
+// reliably is launching Anki as its own real Steam app — same mechanism Quick-Access-Menu app
+// launchers use (a non-Steam-game shortcut + RunGame). Tradeoff: this does switch focus away
+// from the current game (gamescope can only focus one app at a time), but the game keeps running
+// and switching back is quick.
+const ANKI_FLATPAK_EXE = "/usr/bin/flatpak";
+const ANKI_FLATPAK_LAUNCH_OPTIONS = "run net.ankiweb.Anki";
+
+// Non-Steam-game shortcut id for Anki, created lazily on first launch and reused after that.
+// Module scope (not React state) so it survives the QAM remount quirk described below.
+let ankiShortcutAppId: number | null = null;
+
+async function ensureAnkiShortcut(): Promise<number> {
+  if (ankiShortcutAppId !== null && window.appStore.GetAppOverviewByAppID(ankiShortcutAppId)) {
+    return ankiShortcutAppId;
+  }
+  const id = await SteamClient.Apps.AddShortcut("Anki", ANKI_FLATPAK_EXE, "", ANKI_FLATPAK_LAUNCH_OPTIONS);
+  SteamClient.Apps.SetShortcutName(id, "Anki");
+  SteamClient.Apps.SetShortcutExe(id, ANKI_FLATPAK_EXE);
+  SteamClient.Apps.SetShortcutLaunchOptions(id, ANKI_FLATPAK_LAUNCH_OPTIONS);
+  SteamClient.Apps.SpecifyCompatTool(id, "");
+  ankiShortcutAppId = id;
+  return id;
+}
+
+async function launchAnki(): Promise<void> {
+  const appId = await ensureAnkiShortcut();
+  // Give Steam a moment to register the shortcut's exe/launch options before running it.
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  const overview = window.appStore.GetAppOverviewByAppID(appId);
+  if (!overview) {
+    throw new Error("Could not resolve the Anki shortcut after creating it.");
+  }
+  SteamClient.Apps.RunGame(overview.gameid, "", -1, 0);
+}
 
 // The Quick Access Menu remounts this component's tab content right after a Dropdown closes
 // (Steam re-focuses the already-active tab, logging "Trying to change focus to already selected
@@ -47,6 +86,36 @@ function Content() {
   const [audio, setAudioState] = useState(cache.audio);
   const [isCreatingDeck, setIsCreatingDeck] = useState(false);
   const [isAddingCard, setIsAddingCard] = useState(false);
+  const [ankiStatus, setAnkiStatus] = useState<"unknown" | "connected" | "disconnected">("unknown");
+  const [isCheckingStatus, setIsCheckingStatus] = useState(false);
+  const [isLaunchingAnki, setIsLaunchingAnki] = useState(false);
+
+  const onCheckAnkiStatus = () => {
+    setIsCheckingStatus(true);
+    checkAnkiConnection()
+      .then((connected) => setAnkiStatus(connected ? "connected" : "disconnected"))
+      .catch((e) => {
+        console.error("[AnkiCards] check_anki_connection failed:", e);
+        setAnkiStatus("disconnected");
+      })
+      .finally(() => setIsCheckingStatus(false));
+  };
+
+  // Refresh status whenever this tab (re)mounts, including the QAM's remount-on-dropdown-close
+  // quirk — harmless here since it's just a read-only refresh, not something that resets input.
+  useEffect(() => {
+    onCheckAnkiStatus();
+  }, []);
+
+  const onOpenAnki = () => {
+    setIsLaunchingAnki(true);
+    launchAnki()
+      .catch((e) => {
+        console.error("[AnkiCards] launchAnki failed:", e);
+        toaster.toast({ title: "Could not open Anki", body: String(e) });
+      })
+      .finally(() => setIsLaunchingAnki(false));
+  };
 
   const setLanguage = (value: string) => {
     cache.language = value;
@@ -109,7 +178,53 @@ function Content() {
       .finally(() => setIsAddingCard(false));
   };
 
+  const ankiStatusGlyph = ankiStatus === "connected" ? "✓" : ankiStatus === "disconnected" ? "✗" : "…";
+  const ankiStatusColor = ankiStatus === "connected" ? "#2ecc71" : ankiStatus === "disconnected" ? "#e74c3c" : "#888";
+
   return (
+    <>
+    <PanelSection title="Anki Status">
+      <PanelSectionRow>
+        <Field label="AnkiConnect">
+          <span
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+              width: "20px",
+              height: "20px",
+              borderRadius: "50%",
+              backgroundColor: ankiStatusColor,
+              color: "white",
+              fontSize: "12px",
+              lineHeight: 1,
+            }}
+          >
+            {ankiStatusGlyph}
+          </span>
+        </Field>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem
+          layout="below"
+          disabled={isCheckingStatus}
+          onClick={onCheckAnkiStatus}
+        >
+          Check Status
+        </ButtonItem>
+      </PanelSectionRow>
+    </PanelSection>
+    <PanelSection title="Anki App">
+      <PanelSectionRow>
+        <ButtonItem
+          layout="below"
+          disabled={isLaunchingAnki}
+          onClick={onOpenAnki}
+        >
+          Open Anki
+        </ButtonItem>
+      </PanelSectionRow>
+    </PanelSection>
     <PanelSection title="New Card">
       <PanelSectionRow>
         <DropdownItem
@@ -170,6 +285,7 @@ function Content() {
         </ButtonItem>
       </PanelSectionRow>
     </PanelSection>
+    </>
   );
 };
 
