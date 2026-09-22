@@ -1,8 +1,8 @@
 import os
 import json
-import re
 import urllib.request
 import urllib.error
+import urllib.parse
 
 # The decky plugin module is located at decky-loader/plugin
 # For easy intellisense checkout the decky-loader code repo
@@ -11,6 +11,23 @@ import decky
 import asyncio
 
 ANKICONNECT_URL = "http://127.0.0.1:8765"
+
+NOTE_TYPE_NAME = "Decky Anki Plugin Note Type"
+NOTE_TYPE_FIELDS = ["Morph", "Definition/Translation", "Image", "Audio"]
+NOTE_TYPE_CSS = (
+    ".card {\n"
+    " font-family: arial;\n"
+    " font-size: 20px;\n"
+    " text-align: center;\n"
+    " color: black;\n"
+    " background-color: white;\n"
+    "}"
+)
+NOTE_TYPE_FRONT_TEMPLATE = "{{Morph}}"
+NOTE_TYPE_BACK_TEMPLATE = (
+    "{{FrontSide}}\n\n<hr id=\"answer\">\n\n"
+    "{{Definition/Translation}}\n\n{{Image}}\n\n{{Audio}}"
+)
 
 def _ankiconnect_request(action: str, params: dict = None, version: int = 6):
     payload = json.dumps({"action": action, "version": version, "params": params or {}}).encode("utf-8")
@@ -21,96 +38,90 @@ def _ankiconnect_request(action: str, params: dict = None, version: int = 6):
         raise Exception(body["error"])
     return body["result"]
 
-_TEMPLATE_PLACEHOLDER = re.compile(r"\{\{([^}]+)\}\}")
+def _deck_name_for_language(language: str) -> str:
+    return f"Decky Anki Plugin Deck ({language})"
 
-# Anki has no per-field "required" flag. The closest real signal: a note only fails to save if
-# every card template's rendered Front side is empty, so a field referenced on a Front template
-# is what actually needs a value to produce a card.
-def _fields_used_on_front_templates(templates: dict) -> set:
-    field_names = set()
-    for template in templates.values():
-        front_html = template.get("Front", "")
-        for raw in _TEMPLATE_PLACEHOLDER.findall(front_html):
-            name = raw.strip()
-            if name.startswith(("#", "/", "^")):
-                name = name[1:].strip()
-            if ":" in name:
-                name = name.rsplit(":", 1)[-1].strip()
-            if name and name != "FrontSide":
-                field_names.add(name)
-    return field_names
+# Builds an AnkiConnect picture/audio media entry from a user-typed path or URL, or None if
+# empty. AnkiConnect distinguishes remote vs local media by which param is set: `url` for
+# http(s), `path` for a local filesystem path (e.g. a file on the Deck itself).
+def _build_media_entry(value: str, field_name: str):
+    value = (value or "").strip()
+    if not value:
+        return None
+    entry = {"fields": [field_name]}
+    if value.lower().startswith(("http://", "https://")):
+        filename = os.path.basename(urllib.parse.urlsplit(value).path) or f"decky_{field_name.lower()}"
+        entry["url"] = value
+    else:
+        path = os.path.expanduser(value)
+        filename = os.path.basename(path) or f"decky_{field_name.lower()}"
+        entry["path"] = path
+    entry["filename"] = filename
+    return entry
 
 class Plugin:
-    # A normal method. It can be called from the TypeScript side using @decky/api.
-    async def add(self, left: int, right: int) -> int:
-        return left + right
+    async def _ensure_deck_and_model(self, loop, deck_name: str) -> None:
+        await loop.run_in_executor(None, _ankiconnect_request, "createDeck", {"deck": deck_name})
+        existing_models = await loop.run_in_executor(None, _ankiconnect_request, "modelNames")
+        if NOTE_TYPE_NAME not in existing_models:
+            await loop.run_in_executor(None, _ankiconnect_request, "createModel", {
+                "modelName": NOTE_TYPE_NAME,
+                "inOrderFields": NOTE_TYPE_FIELDS,
+                "css": NOTE_TYPE_CSS,
+                "isCloze": False,
+                "cardTemplates": [
+                    {"Name": "Card 1", "Front": NOTE_TYPE_FRONT_TEMPLATE, "Back": NOTE_TYPE_BACK_TEMPLATE},
+                ],
+            })
 
-    # Returns deck names from AnkiConnect. Requires Anki running with AnkiConnect installed.
-    async def get_decks(self) -> list:
+    # Creates (or reuses, if already present) the plugin's per-language deck and shared note
+    # type. Requires Anki running with AnkiConnect installed.
+    async def create_deck_for_language(self, language: str) -> str:
         loop = asyncio.get_event_loop()
         try:
-            decks = await loop.run_in_executor(None, _ankiconnect_request, "deckNames")
-            decky.logger.info(f"get_decks: found {len(decks)} decks: {decks}")
-            return decks
+            deck_name = _deck_name_for_language(language)
+            await self._ensure_deck_and_model(loop, deck_name)
+            decky.logger.info(f"create_deck_for_language: ensured deck {deck_name!r} and note type {NOTE_TYPE_NAME!r}")
+            return deck_name
         except (urllib.error.URLError, ConnectionError) as e:
             decky.logger.error(f"Could not reach AnkiConnect at {ANKICONNECT_URL}: {e}")
             raise Exception(f"Could not reach AnkiConnect. Is Anki running with AnkiConnect installed? ({e})")
 
-    # Returns the note type (model) names actually used by notes in the given deck. Only reads
-    # note IDs (findNotes) to check membership, never note/card field content.
-    async def get_deck_models(self, deck_name: str) -> list:
+    # Adds a note to the language's deck, creating the deck/note type first if needed. Image and
+    # audio are AnkiConnect media refs (path or URL), not raw field text.
+    async def add_note(self, language: str, morph: str, definition: str, image: str, audio: str) -> int:
         loop = asyncio.get_event_loop()
         try:
-            all_models = await loop.run_in_executor(None, _ankiconnect_request, "modelNames")
-            matching = []
-            for model_name in all_models:
-                query = f'deck:"{deck_name}" note:"{model_name}"'
-                note_ids = await loop.run_in_executor(
-                    None, _ankiconnect_request, "findNotes", {"query": query})
-                if note_ids:
-                    matching.append(model_name)
-            decky.logger.info(f"get_deck_models: deck {deck_name!r} models {matching}")
-            return matching
+            if not morph or not morph.strip():
+                raise Exception("Morph is required.")
+            deck_name = _deck_name_for_language(language)
+            await self._ensure_deck_and_model(loop, deck_name)
+
+            note = {
+                "deckName": deck_name,
+                "modelName": NOTE_TYPE_NAME,
+                "fields": {
+                    "Morph": morph,
+                    "Definition/Translation": definition,
+                    "Image": "",
+                    "Audio": "",
+                },
+                "options": {"allowDuplicate": False},
+                "tags": [],
+            }
+            picture_entry = _build_media_entry(image, "Image")
+            if picture_entry:
+                note["picture"] = [picture_entry]
+            audio_entry = _build_media_entry(audio, "Audio")
+            if audio_entry:
+                note["audio"] = [audio_entry]
+
+            note_id = await loop.run_in_executor(None, _ankiconnect_request, "addNote", {"note": note})
+            decky.logger.info(f"add_note: added note {note_id} to deck {deck_name!r}")
+            return note_id
         except (urllib.error.URLError, ConnectionError) as e:
             decky.logger.error(f"Could not reach AnkiConnect at {ANKICONNECT_URL}: {e}")
             raise Exception(f"Could not reach AnkiConnect. Is Anki running with AnkiConnect installed? ({e})")
-
-    # Returns the fields of the given note type (model), in modelFieldNames order, each with its
-    # field description (shown in Anki's own "Add" dialog). Everything addNote later needs to
-    # build a note: model name (caller already has it) + these field names. Schema only, no
-    # note/card data read.
-    async def get_model_fields(self, model_name: str) -> list:
-        loop = asyncio.get_event_loop()
-        try:
-            names = await loop.run_in_executor(
-                None, _ankiconnect_request, "modelFieldNames", {"modelName": model_name})
-            try:
-                descriptions = await loop.run_in_executor(
-                    None, _ankiconnect_request, "modelFieldDescriptions", {"modelName": model_name})
-            except Exception as e:
-                decky.logger.warning(f"get_model_fields: modelFieldDescriptions unavailable for {model_name!r}: {e}")
-                descriptions = [""] * len(names)
-            try:
-                templates = await loop.run_in_executor(
-                    None, _ankiconnect_request, "modelTemplates", {"modelName": model_name})
-                front_fields = _fields_used_on_front_templates(templates)
-            except Exception as e:
-                decky.logger.warning(f"get_model_fields: modelTemplates unavailable for {model_name!r}: {e}")
-                front_fields = set()
-            fields = [
-                {"name": name, "description": description, "required": name in front_fields}
-                for name, description in zip(names, descriptions)
-            ]
-            decky.logger.info(f"get_model_fields: model {model_name!r} fields {fields}")
-            return fields
-        except (urllib.error.URLError, ConnectionError) as e:
-            decky.logger.error(f"Could not reach AnkiConnect at {ANKICONNECT_URL}: {e}")
-            raise Exception(f"Could not reach AnkiConnect. Is Anki running with AnkiConnect installed? ({e})")
-
-    async def long_running(self):
-        await asyncio.sleep(15)
-        # Passing through a bunch of random data, just as an example
-        await decky.emit("timer_event", "Hello from the backend!", True, 2)
 
     # Asyncio-compatible long-running code, executed in a task when the plugin is loaded
     async def _main(self):
@@ -128,9 +139,6 @@ class Plugin:
     async def _uninstall(self):
         decky.logger.info("Goodbye World!")
         pass
-
-    async def start_timer(self):
-        self.loop.create_task(self.long_running())
 
     # Migrations that should be performed before entering `_main()`.
     async def _migration(self):

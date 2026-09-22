@@ -13,206 +13,161 @@ import {
   definePlugin,
   toaster,
 } from "@decky/api"
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import { FaShip } from "react-icons/fa";
 
-interface ModelField {
-  name: string;
-  description: string;
-  required: boolean;
-}
+const createDeckForLanguage = callable<[language: string], string>("create_deck_for_language");
+const addNote = callable<[language: string, morph: string, definition: string, image: string, audio: string], number>("add_note");
 
-const getDecks = callable<[], string[]>("get_decks");
-const getDeckModels = callable<[deck_name: string], string[]>("get_deck_models");
-const getModelFields = callable<[model_name: string], ModelField[]>("get_model_fields");
+// Single source of truth for the language preset list. Add/remove a language here only — no
+// backend change needed, the backend just formats whatever string it's given.
+const LANGUAGES = [
+  "Japanese", "Spanish", "French", "German", "Korean",
+  "Mandarin Chinese", "Italian", "Portuguese", "Russian", "Arabic",
+];
+
+const deckNameForLanguage = (language: string) => `Decky Anki Plugin Deck (${language})`;
 
 // The Quick Access Menu remounts this component's tab content right after a Dropdown closes
 // (Steam re-focuses the already-active tab, logging "Trying to change focus to already selected
 // tab"). Module-scope cache + write-through survives that remount so selections don't reset.
 const cache = {
-  deckName: "",
-  modelName: "",
-  fieldValues: {} as Record<string, string>,
+  language: "",
+  morph: "",
+  definition: "",
+  image: "",
+  audio: "",
 };
 
 function Content() {
-  const [decks, setDecks] = useState<string[]>([]);
-  const [deckName, setDeckNameState] = useState(cache.deckName);
-  const [models, setModels] = useState<string[]>([]);
-  const [modelName, setModelNameState] = useState(cache.modelName);
-  const [modelFields, setModelFields] = useState<ModelField[]>([]);
-  const [fieldValues, setFieldValuesState] = useState<Record<string, string>>(cache.fieldValues);
+  const [language, setLanguageState] = useState(cache.language);
+  const [morph, setMorphState] = useState(cache.morph);
+  const [definition, setDefinitionState] = useState(cache.definition);
+  const [image, setImageState] = useState(cache.image);
+  const [audio, setAudioState] = useState(cache.audio);
+  const [isCreatingDeck, setIsCreatingDeck] = useState(false);
+  const [isAddingCard, setIsAddingCard] = useState(false);
 
-  const setDeckName = (value: string) => {
-    cache.deckName = value;
-    setDeckNameState(value);
+  const setLanguage = (value: string) => {
+    cache.language = value;
+    setLanguageState(value);
   };
-  const setModelName = (value: string) => {
-    cache.modelName = value;
-    setModelNameState(value);
+  const setMorph = (value: string) => {
+    cache.morph = value;
+    setMorphState(value);
   };
-  const setFieldValues = (value: Record<string, string> | ((prev: Record<string, string>) => Record<string, string>)) => {
-    setFieldValuesState((prev) => {
-      const next = typeof value === "function" ? value(prev) : value;
-      cache.fieldValues = next;
-      return next;
-    });
+  const setDefinition = (value: string) => {
+    cache.definition = value;
+    setDefinitionState(value);
+  };
+  const setImage = (value: string) => {
+    cache.image = value;
+    setImageState(value);
+  };
+  const setAudio = (value: string) => {
+    cache.audio = value;
+    setAudioState(value);
   };
 
-  useEffect(() => {
-    getDecks()
-      .then((result) => {
-        console.log("[AnkiCards] get_decks resolved:", result);
-        setDecks(result);
-      })
-      .catch((e) => {
-        console.error("[AnkiCards] get_decks failed:", e);
-        toaster.toast({ title: "Could not load decks", body: String(e) });
-      });
-  }, []);
-
-  // First run of this effect can be a genuine mount (deckName === "") or a QAM-triggered remount
-  // rehydrating a previously picked deck from `cache` — only reset downstream state on a real
-  // user-driven change (every run after the first).
-  const isDeckEffectFirstRun = useRef(true);
-  useEffect(() => {
-    console.log("[AnkiCards] deckName state is now:", deckName);
-    const isFirstRun = isDeckEffectFirstRun.current;
-    isDeckEffectFirstRun.current = false;
-    if (!isFirstRun) {
-      setModelName("");
-      setModelFields([]);
-      setFieldValues({});
-    }
-    if (!deckName) {
-      setModels([]);
-      return;
-    }
-    getDeckModels(deckName)
-      .then((result) => {
-        console.log(`[AnkiCards] get_deck_models(${deckName}) resolved:`, result);
-        setModels(result);
-      })
-      .catch((e) => {
-        console.error(`[AnkiCards] get_deck_models(${deckName}) failed:`, e);
-        toaster.toast({ title: "Could not load note types for deck", body: String(e) });
-      });
-  }, [deckName]);
-
-  const isModelEffectFirstRun = useRef(true);
-  useEffect(() => {
-    console.log("[AnkiCards] modelName state is now:", modelName);
-    const isFirstRun = isModelEffectFirstRun.current;
-    isModelEffectFirstRun.current = false;
-    if (!modelName) {
-      setModelFields([]);
-      if (!isFirstRun) {
-        setFieldValues({});
-      }
-      return;
-    }
-    getModelFields(modelName)
-      .then((result) => {
-        console.log(`[AnkiCards] get_model_fields(${modelName}) resolved:`, result);
-        setModelFields(result);
-        setFieldValues((prev) => {
-          if (isFirstRun) {
-            // Rehydrating after a remount: keep whatever was already typed, just backfill
-            // any field this model has that the cache doesn't know about yet.
-            const merged = { ...prev };
-            for (const field of result) {
-              if (!(field.name in merged)) {
-                merged[field.name] = "";
-              }
-            }
-            return merged;
-          }
-          const initialValues: Record<string, string> = {};
-          for (const field of result) {
-            initialValues[field.name] = "";
-          }
-          return initialValues;
-        });
-      })
-      .catch((e) => {
-        console.error(`[AnkiCards] get_model_fields(${modelName}) failed:`, e);
-        toaster.toast({ title: "Could not load fields", body: String(e) });
-      });
-  }, [modelName]);
-
-  const deckOptions: DropdownOption[] = decks.map((deck) => ({ data: deck, label: deck }));
-  const modelOptions: DropdownOption[] = models.map((model) => ({ data: model, label: model }));
+  const languageOptions: DropdownOption[] = LANGUAGES.map((lang) => ({ data: lang, label: lang }));
 
   const extractOptionValue = (option: DropdownOption): string => {
     return option && typeof option === "object" && "data" in option ? option.data : (option as unknown as string);
   };
 
-  const onDeckChange = (option: DropdownOption) => {
-    console.log("[AnkiCards] Deck onChange option:", option);
-    setDeckName(extractOptionValue(option));
+  const onLanguageChange = (option: DropdownOption) => {
+    setLanguage(extractOptionValue(option));
   };
 
-  const onModelChange = (option: DropdownOption) => {
-    console.log("[AnkiCards] Note Type onChange option:", option);
-    setModelName(extractOptionValue(option));
-  };
-
-  const onFieldChange = (fieldName: string, value: string) => {
-    setFieldValues((prev) => ({ ...prev, [fieldName]: value }));
+  const onCreateDeck = () => {
+    setIsCreatingDeck(true);
+    createDeckForLanguage(language)
+      .then((deckName) => {
+        toaster.toast({ title: "Deck ready", body: deckName });
+      })
+      .catch((e) => {
+        console.error("[AnkiCards] create_deck_for_language failed:", e);
+        toaster.toast({ title: "Could not create deck", body: String(e) });
+      })
+      .finally(() => setIsCreatingDeck(false));
   };
 
   const onAddCard = () => {
-    // TODO: call AnkiConnect "addNote" with { deckName, modelName, fields: fieldValues } once verified
-    toaster.toast({
-      title: "Card ready",
-      body: `${deckName || "(no deck)"} / ${modelName || "(no note type)"}: ${JSON.stringify(fieldValues)}`
-    });
+    setIsAddingCard(true);
+    addNote(language, morph, definition, image, audio)
+      .then((noteId) => {
+        toaster.toast({ title: "Card added", body: `Note ${noteId} added to ${deckNameForLanguage(language)}` });
+        setMorph("");
+        setDefinition("");
+        setImage("");
+        setAudio("");
+      })
+      .catch((e) => {
+        console.error("[AnkiCards] add_note failed:", e);
+        toaster.toast({ title: "Could not add card", body: String(e) });
+      })
+      .finally(() => setIsAddingCard(false));
   };
 
   return (
     <PanelSection title="New Card">
       <PanelSectionRow>
         <DropdownItem
-          label="Deck"
-          rgOptions={deckOptions}
-          selectedOption={deckName}
-          onChange={onDeckChange}
-          strDefaultLabel="Select a deck"
+          label="Language"
+          rgOptions={languageOptions}
+          selectedOption={language}
+          onChange={onLanguageChange}
+          strDefaultLabel="Select a language"
         />
       </PanelSectionRow>
       <PanelSectionRow>
-        <DropdownItem
-          label="Note Type"
-          rgOptions={modelOptions}
-          selectedOption={modelName}
-          onChange={onModelChange}
-          strDefaultLabel={deckName ? "Select a note type" : "Select a deck first"}
-          disabled={!deckName}
-        />
+        <Field label="Deck">{language ? deckNameForLanguage(language) : "(select a language)"}</Field>
       </PanelSectionRow>
-      {modelFields.map((field) => (
-        <PanelSectionRow key={field.name}>
-          <TextField
-            label={`${field.name}${field.required ? " *" : ""} (${modelName})`}
-            description={field.description || undefined}
-            value={fieldValues[field.name]}
-            onChange={(e) => onFieldChange(field.name, e.target.value)}
-          />
-        </PanelSectionRow>
-      ))}
       <PanelSectionRow>
         <ButtonItem
           layout="below"
+          disabled={!language || isCreatingDeck}
+          onClick={onCreateDeck}
+        >
+          Create Deck
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <TextField
+          label="Morph *"
+          value={morph}
+          onChange={(e) => setMorph(e.target.value)}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <TextField
+          label="Definition / Translation"
+          value={definition}
+          onChange={(e) => setDefinition(e.target.value)}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <TextField
+          label="Image (file path or URL)"
+          value={image}
+          onChange={(e) => setImage(e.target.value)}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <TextField
+          label="Audio (file path or URL)"
+          value={audio}
+          onChange={(e) => setAudio(e.target.value)}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem
+          layout="below"
+          disabled={!language || !morph || isAddingCard}
           onClick={onAddCard}
         >
           Add Card
         </ButtonItem>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <Field label="Debug: deckName / modelName">{`${deckName || "(none)"} / ${modelName || "(none)"}`}</Field>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <Field label="Debug: fieldValues">{JSON.stringify(fieldValues)}</Field>
       </PanelSectionRow>
     </PanelSection>
   );
