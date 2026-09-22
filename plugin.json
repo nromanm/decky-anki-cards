@@ -1,12 +1,12 @@
 {
-  "name": "Anki Card Generator",
+  "name": "Anki Cards",
   "author": "John Doe",
   "flags": ["debug", "_root"],
   "version": "0.0.1",
   "api_version": 1,
   "publish": {
-    "tags": ["template", "root"],
-    "description": "Decky example plugin.",
+    "tags": ["anki", "flashcards"],
+    "description": "Add cards to Anki decks from your Steam Deck.",
     "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/PluginLoader"
   }
 }

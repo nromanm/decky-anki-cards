@@ -1,7 +1,7 @@
 {
-  "name": "decky-plugin-template",
+  "name": "decky-anki-cards",
   "version": "0.0.1",
-  "description": "A template to quickly create decky plugins from scratch, based on TypeScript and webpack",
+  "description": "Decky Loader plugin for Steam Deck that adds cards to Anki decks.",
   "type": "module",
   "scripts": {
     "build": "rollup -c",
