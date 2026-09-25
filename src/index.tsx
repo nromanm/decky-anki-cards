@@ -17,6 +17,7 @@ import { useEffect, useState } from "react";
 import { FaShip } from "react-icons/fa";
 
 const checkAnkiConnection = callable<[], boolean>("check_anki_connection");
+const checkAnkiServiceStatus = callable<[], string>("check_anki_service_status");
 const createDeckForLanguage = callable<[language: string], string>("create_deck_for_language");
 const addNote = callable<[language: string, morph: string, definition: string, image: string, audio: string], number>("add_note");
 
@@ -87,18 +88,26 @@ function Content() {
   const [isCreatingDeck, setIsCreatingDeck] = useState(false);
   const [isAddingCard, setIsAddingCard] = useState(false);
   const [ankiStatus, setAnkiStatus] = useState<"unknown" | "connected" | "disconnected">("unknown");
+  const [serviceStatus, setServiceStatus] = useState<string>("unknown");
   const [isCheckingStatus, setIsCheckingStatus] = useState(false);
   const [isLaunchingAnki, setIsLaunchingAnki] = useState(false);
 
   const onCheckAnkiStatus = () => {
     setIsCheckingStatus(true);
-    checkAnkiConnection()
-      .then((connected) => setAnkiStatus(connected ? "connected" : "disconnected"))
-      .catch((e) => {
-        console.error("[AnkiCards] check_anki_connection failed:", e);
-        setAnkiStatus("disconnected");
-      })
-      .finally(() => setIsCheckingStatus(false));
+    Promise.all([
+      checkAnkiConnection()
+        .then((connected) => setAnkiStatus(connected ? "connected" : "disconnected"))
+        .catch((e) => {
+          console.error("[AnkiCards] check_anki_connection failed:", e);
+          setAnkiStatus("disconnected");
+        }),
+      checkAnkiServiceStatus()
+        .then((status) => setServiceStatus(status))
+        .catch((e) => {
+          console.error("[AnkiCards] check_anki_service_status failed:", e);
+          setServiceStatus("unknown");
+        }),
+    ]).finally(() => setIsCheckingStatus(false));
   };
 
   // Refresh status whenever this tab (re)mounts, including the QAM's remount-on-dropdown-close
@@ -203,6 +212,9 @@ function Content() {
             {ankiStatusGlyph}
           </span>
         </Field>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <Field label="Background service">{serviceStatus}</Field>
       </PanelSectionRow>
       <PanelSectionRow>
         <ButtonItem

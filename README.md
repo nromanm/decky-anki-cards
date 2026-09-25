@@ -2,6 +2,22 @@
 
 Reference example for using [decky-frontend-lib](https://github.com/SteamDeckHomebrew/decky-frontend-lib) (@decky/ui) in a [decky-loader](https://github.com/SteamDeckHomebrew/decky-loader) plugin.
 
+## Optional: run Anki in the background automatically
+
+The plugin's "Open Anki" button switches focus to Anki as its own app (reliable, but leaves
+whatever game you were playing). If you'd rather have Anki already running in the background
+before you start playing — so AnkiConnect just works, no focus switch needed — SSH into your
+Deck (or open a terminal in Desktop Mode) and run, once:
+
+```bash
+./scripts/setup-anki-service.sh
+```
+
+This installs Anki via Flatpak if it isn't already, and sets up a `systemd --user` service that
+starts Anki (no window) automatically every time you boot into Gaming Mode, before any game is
+running. The plugin's "Anki Status" panel only ever *checks* this service — it never installs or
+enables anything on its own, so this step is entirely optional and manual.
+
 ### **Please also refer to the [wiki](https://wiki.deckbrew.xyz/en/user-guide/home#plugin-development) for important information on plugin development and submissions/updates. currently documentation is split between this README and the wiki which is something we are hoping to rectify in the future.**  
 
 ## Developers

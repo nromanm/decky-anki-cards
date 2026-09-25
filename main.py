@@ -1,5 +1,6 @@
 import os
 import json
+import subprocess
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -11,6 +12,10 @@ import decky
 import asyncio
 
 ANKICONNECT_URL = "http://127.0.0.1:8765"
+
+# Set up by scripts/setup-anki-service.sh, run once by the user directly on the Deck — this
+# plugin never installs or enables it itself, only checks its status.
+ANKI_SERVICE_UNIT = "anki-background.service"
 
 NOTE_TYPE_NAME = "Decky Anki Plugin Note Type"
 NOTE_TYPE_FIELDS = ["Morph", "Definition/Translation", "Image", "Audio"]
@@ -71,6 +76,27 @@ class Plugin:
         except Exception as e:
             decky.logger.info(f"check_anki_connection: not connected: {e}")
             return False
+
+    # Read-only check of the optional background systemd service (set up by
+    # scripts/setup-anki-service.sh, never by this plugin). Returns systemctl's raw state string
+    # ("active", "inactive", "failed", ...), or "unknown" if the check itself couldn't run (e.g.
+    # the service was never set up, so systemd has no user session bus to query in some cases).
+    async def check_anki_service_status(self) -> str:
+        loop = asyncio.get_event_loop()
+        try:
+            env = os.environ.copy()
+            env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+            result = await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    ["systemctl", "--user", "is-active", ANKI_SERVICE_UNIT],
+                    capture_output=True, text=True, env=env, timeout=5,
+                ),
+            )
+            return result.stdout.strip() or "unknown"
+        except Exception as e:
+            decky.logger.info(f"check_anki_service_status: could not check: {e}")
+            return "unknown"
 
     async def _ensure_deck_and_model(self, loop, deck_name: str) -> None:
         await loop.run_in_executor(None, _ankiconnect_request, "createDeck", {"deck": deck_name})
