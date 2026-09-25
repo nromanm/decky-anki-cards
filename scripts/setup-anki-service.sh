@@ -23,6 +23,16 @@ if ! flatpak info "$ANKI_APP_ID" >/dev/null 2>&1; then
   fi
 fi
 
+echo
+echo "The background service starts Anki with no window, so it can't click through a first-run"
+echo "AnkiWeb login/sync prompt."
+read -r -p "Have you already opened Anki once and logged into AnkiWeb? [y/N] " reply
+if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+  echo "Open Anki now (Desktop Mode, or the plugin's \"Open Anki\" button), log into AnkiWeb" >&2
+  echo "(Tools/sync icon -> sign in), close Anki, then re-run this script." >&2
+  exit 1
+fi
+
 mkdir -p "$UNIT_DIR"
 cat > "$UNIT_PATH" <<EOF
 [Unit]

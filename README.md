@@ -18,6 +18,63 @@ starts Anki (no window) automatically every time you boot into Gaming Mode, befo
 running. The plugin's "Anki Status" panel only ever *checks* this service — it never installs or
 enables anything on its own, so this step is entirely optional and manual.
 
+**Before running the script**, open Anki once normally (Desktop Mode, or the plugin's "Open Anki"
+button) and log into AnkiWeb, then close Anki. The background service runs with no window, so it
+can't click through a first-run AnkiWeb login/sync prompt — doing it once ahead of time avoids
+that.
+
+### Doing it by hand instead of the script
+
+If you'd rather set it up yourself step by step (or the script doesn't work for some reason),
+open a terminal (SSH, or Konsole in Desktop Mode) and run:
+
+1. Install Anki via Flatpak, if you haven't already:
+   ```bash
+   flatpak install -y flathub net.ankiweb.Anki
+   ```
+2. Open Anki once normally (Desktop Mode, or the plugin's "Open Anki" button) and log into
+   AnkiWeb (Tools/sync icon → sign in), then close Anki. **Do this before enabling the service
+   below.** The background service starts Anki with no window, so it can't click through any
+   first-run prompt (AnkiWeb login, sync, profile picker); logging in once ahead of time clears
+   that so the headless service starts cleanly every time after.
+3. Create the service file:
+   ```bash
+   mkdir -p ~/.config/systemd/user
+   cat > ~/.config/systemd/user/anki-background.service <<'EOF'
+   [Unit]
+   Description=Anki (background, for AnkiConnect)
+   PartOf=graphical-session.target
+   After=graphical-session.target
+
+   [Service]
+   EnvironmentFile=%t/gamescope-environment
+   ExecStart=/usr/bin/flatpak run net.ankiweb.Anki
+   Restart=on-failure
+   Slice=session.slice
+
+   [Install]
+   WantedBy=gamescope-session.target
+   EOF
+   ```
+4. Enable and start it:
+   ```bash
+   systemctl --user daemon-reload
+   systemctl --user enable --now anki-background.service
+   ```
+5. Check it's running:
+   ```bash
+   systemctl --user status anki-background.service
+   ```
+   You should see `active (running)`. It will now start automatically every time you enter
+   Gaming Mode, before any game launches.
+
+To remove it later:
+```bash
+systemctl --user disable --now anki-background.service
+rm ~/.config/systemd/user/anki-background.service
+systemctl --user daemon-reload
+```
+
 ### **Please also refer to the [wiki](https://wiki.deckbrew.xyz/en/user-guide/home#plugin-development) for important information on plugin development and submissions/updates. currently documentation is split between this README and the wiki which is something we are hoping to rectify in the future.**  
 
 ## Developers
