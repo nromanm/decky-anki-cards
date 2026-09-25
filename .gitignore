@@ -40,7 +40,10 @@ __pycache__/
 /.yalc
 yalc.lock
 
-.vscode/settings.json
+.vscode/
+.claude/
+.agents/
+skills-lock.json
 
 # Ignore output folder
 
