@@ -1,5 +1,7 @@
 import os
 import json
+import base64
+import mimetypes
 import subprocess
 import urllib.request
 import urllib.error
@@ -65,6 +67,24 @@ def _build_media_entry(value: str, field_name: str):
     return entry
 
 class Plugin:
+    # Reads a local image file and returns it as a data: URI, for the frontend to render as an
+    # <img> preview. Steam's own Screenshot.strUrl isn't loadable from the plugin's content (wrong
+    # origin/CSP for that internal URL) — a data: URI needs no network fetch, so it always renders
+    # regardless of origin.
+    async def get_image_preview(self, path: str) -> str:
+        loop = asyncio.get_event_loop()
+        try:
+            def _read():
+                mime_type, _ = mimetypes.guess_type(path)
+                mime_type = mime_type or "image/png"
+                with open(path, "rb") as f:
+                    data = base64.b64encode(f.read()).decode("ascii")
+                return f"data:{mime_type};base64,{data}"
+            return await loop.run_in_executor(None, _read)
+        except Exception as e:
+            decky.logger.error(f"get_image_preview: could not read {path!r}: {e}")
+            raise Exception(f"Could not load image preview: {e}")
+
     # Lightweight ping to check whether Anki + AnkiConnect are reachable right now. Swallows
     # every error (connection refused, timeout, ...) and just reports false, since callers only
     # care about the yes/no status, not the specific failure.
@@ -156,6 +176,17 @@ class Plugin:
 
             note_id = await loop.run_in_executor(None, _ankiconnect_request, "addNote", {"note": note})
             decky.logger.info(f"add_note: added note {note_id} to deck {deck_name!r}")
+
+            # AnkiConnect has already copied the image into Anki's own media collection at this
+            # point, so the local source file (if it was a local path, not a URL) is redundant —
+            # clean it up so images don't pile up on the Deck's storage.
+            if picture_entry and "path" in picture_entry:
+                try:
+                    os.remove(picture_entry["path"])
+                    decky.logger.info(f"add_note: deleted local image {picture_entry['path']!r} after upload")
+                except OSError as e:
+                    decky.logger.warning(f"add_note: could not delete local image {picture_entry['path']!r}: {e}")
+
             return note_id
         except (urllib.error.URLError, ConnectionError) as e:
             decky.logger.error(f"Could not reach AnkiConnect at {ANKICONNECT_URL}: {e}")

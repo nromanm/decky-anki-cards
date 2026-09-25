@@ -18,6 +18,7 @@ import { FaShip } from "react-icons/fa";
 
 const checkAnkiConnection = callable<[], boolean>("check_anki_connection");
 const checkAnkiServiceStatus = callable<[], string>("check_anki_service_status");
+const getImagePreview = callable<[path: string], string>("get_image_preview");
 const createDeckForLanguage = callable<[language: string], string>("create_deck_for_language");
 const addNote = callable<[language: string, morph: string, definition: string, image: string, audio: string], number>("add_note");
 
@@ -68,6 +69,26 @@ async function launchAnki(): Promise<void> {
   SteamClient.Apps.RunGame(overview.gameid, "", -1, 0);
 }
 
+// Decky plugins can't trigger a screenshot capture themselves — only read whatever Steam's own
+// screenshot hotkey (Steam + R1) most recently took. "Take"/"Retake" means: the user presses that
+// hotkey, then this pulls the result in. `GetLocalScreenshotPath` resolves the actual on-disk
+// file, which is what AnkiConnect needs and what the backend reads to build a preview.
+//
+// GetLocalScreenshotPath's first argument must be the string "gameid" (`strGameID`), not the
+// plain numeric Steam App ID (`nAppID`) — despite the ambient type declaration saying `number`.
+// Every other Screenshots method (DeleteLocalScreenshot, ShowScreenshotInSystemViewer, ...) takes
+// a string appId; passing the raw numeric App ID here gets rejected by Steam's native binding
+// with "invalid arguments (arg 0)".
+//
+// Screenshot.strUrl (Steam's own internal URL for its screenshot manager UI) isn't usable as an
+// <img> src here — the plugin's content isn't a trusted origin for it and it renders as a broken
+// image. get_image_preview reads the file server-side and returns a data: URI instead, which
+// needs no network fetch and so always renders regardless of origin/CSP.
+async function useLastScreenshotPath(): Promise<string> {
+  const screenshot = await SteamClient.Screenshots.GetLastScreenshotTaken();
+  return SteamClient.Screenshots.GetLocalScreenshotPath(screenshot.strGameID as unknown as number, screenshot.hHandle);
+}
+
 // The Quick Access Menu remounts this component's tab content right after a Dropdown closes
 // (Steam re-focuses the already-active tab, logging "Trying to change focus to already selected
 // tab"). Module-scope cache + write-through survives that remount so selections don't reset.
@@ -76,6 +97,7 @@ const cache = {
   morph: "",
   definition: "",
   image: "",
+  imagePreviewUrl: "",
   audio: "",
 };
 
@@ -84,9 +106,11 @@ function Content() {
   const [morph, setMorphState] = useState(cache.morph);
   const [definition, setDefinitionState] = useState(cache.definition);
   const [image, setImageState] = useState(cache.image);
+  const [imagePreviewUrl, setImagePreviewUrlState] = useState(cache.imagePreviewUrl);
   const [audio, setAudioState] = useState(cache.audio);
   const [isCreatingDeck, setIsCreatingDeck] = useState(false);
   const [isAddingCard, setIsAddingCard] = useState(false);
+  const [isLoadingScreenshot, setIsLoadingScreenshot] = useState(false);
   const [ankiStatus, setAnkiStatus] = useState<"unknown" | "connected" | "disconnected">("unknown");
   const [serviceStatus, setServiceStatus] = useState<string>("unknown");
   const [isCheckingStatus, setIsCheckingStatus] = useState(false);
@@ -126,6 +150,26 @@ function Content() {
       .finally(() => setIsLaunchingAnki(false));
   };
 
+  const onTakeScreenshot = () => {
+    setIsLoadingScreenshot(true);
+    useLastScreenshotPath()
+      .then((path) => {
+        setImage(path);
+        return getImagePreview(path);
+      })
+      .then((previewUrl) => setImagePreviewUrl(previewUrl))
+      .catch((e) => {
+        console.error("[AnkiCards] onTakeScreenshot failed:", e);
+        toaster.toast({ title: "Could not get last screenshot", body: String(e) });
+      })
+      .finally(() => setIsLoadingScreenshot(false));
+  };
+
+  const onDeleteImage = () => {
+    setImage("");
+    setImagePreviewUrl("");
+  };
+
   const setLanguage = (value: string) => {
     cache.language = value;
     setLanguageState(value);
@@ -141,6 +185,10 @@ function Content() {
   const setImage = (value: string) => {
     cache.image = value;
     setImageState(value);
+  };
+  const setImagePreviewUrl = (value: string) => {
+    cache.imagePreviewUrl = value;
+    setImagePreviewUrlState(value);
   };
   const setAudio = (value: string) => {
     cache.audio = value;
@@ -178,6 +226,7 @@ function Content() {
         setMorph("");
         setDefinition("");
         setImage("");
+        setImagePreviewUrl("");
         setAudio("");
       })
       .catch((e) => {
@@ -274,11 +323,32 @@ function Content() {
         />
       </PanelSectionRow>
       <PanelSectionRow>
-        <TextField
-          label="Image (file path or URL)"
-          value={image}
-          onChange={(e) => setImage(e.target.value)}
-        />
+        {imagePreviewUrl ? (
+          <img
+            src={imagePreviewUrl}
+            style={{ width: "100%", borderRadius: "4px", display: "block" }}
+          />
+        ) : (
+          <Field label="Image">No image selected</Field>
+        )}
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem
+          layout="below"
+          disabled={isLoadingScreenshot}
+          onClick={onTakeScreenshot}
+        >
+          {imagePreviewUrl ? "Retake (use last screenshot)" : "Take (use last screenshot)"}
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem
+          layout="below"
+          disabled={!imagePreviewUrl}
+          onClick={onDeleteImage}
+        >
+          Delete Image
+        </ButtonItem>
       </PanelSectionRow>
       <PanelSectionRow>
         <TextField
