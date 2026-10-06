@@ -1,8 +1,10 @@
 import {
   ButtonItem,
+  DialogButton,
   DropdownItem,
   DropdownOption,
   Field,
+  Focusable,
   PanelSection,
   PanelSectionRow,
   TextField,
@@ -17,19 +19,19 @@ import { useEffect, useState } from "react";
 import { FaShip } from "react-icons/fa";
 
 const checkAnkiConnection = callable<[], boolean>("check_anki_connection");
-const checkAnkiServiceStatus = callable<[], string>("check_anki_service_status");
 const getImagePreview = callable<[path: string], string>("get_image_preview");
-const createDeckForLanguage = callable<[language: string], string>("create_deck_for_language");
-const addNote = callable<[language: string, morph: string, definition: string, image: string, audio: string], number>("add_note");
+const createDeck = callable<[], string>("create_deck");
+const addNote = callable<[morph: string, definition: string, image: string, audio: string], number>("add_note");
 
-// Single source of truth for the language preset list. Add/remove a language here only — no
-// backend change needed, the backend just formats whatever string it's given.
-const LANGUAGES = [
-  "Japanese", "Spanish", "French", "German", "Korean",
+const DECK_NAME = "Decky Anki Plugin Deck";
+
+// Single source of truth for the language preset list used by the origin/target selectors below
+// (prep for a future feature: OCR the Morph/Text off a screenshot and auto-translate it). Add or
+// remove a language here only — no backend change needed.
+const LANGUAGE_OPTIONS = [
+  "Japanese", "English", "Spanish", "French", "German", "Korean",
   "Mandarin Chinese", "Italian", "Portuguese", "Russian", "Arabic",
 ];
-
-const deckNameForLanguage = (language: string) => `Decky Anki Plugin Deck (${language})`;
 
 // Both a headless background launch and piggybacking on another game's Launch Options were
 // confirmed broken: Anki starts but hangs before AnkiConnect loads (likely stuck on a dialog,
@@ -93,18 +95,20 @@ async function useLastScreenshotPath(): Promise<string> {
 // (Steam re-focuses the already-active tab, logging "Trying to change focus to already selected
 // tab"). Module-scope cache + write-through survives that remount so selections don't reset.
 const cache = {
-  language: "",
   morph: "",
   definition: "",
+  originLanguage: "Japanese",
+  targetLanguage: "English",
   image: "",
   imagePreviewUrl: "",
   audio: "",
 };
 
 function Content() {
-  const [language, setLanguageState] = useState(cache.language);
   const [morph, setMorphState] = useState(cache.morph);
   const [definition, setDefinitionState] = useState(cache.definition);
+  const [originLanguage, setOriginLanguageState] = useState(cache.originLanguage);
+  const [targetLanguage, setTargetLanguageState] = useState(cache.targetLanguage);
   const [image, setImageState] = useState(cache.image);
   const [imagePreviewUrl, setImagePreviewUrlState] = useState(cache.imagePreviewUrl);
   const [audio, setAudioState] = useState(cache.audio);
@@ -112,26 +116,18 @@ function Content() {
   const [isAddingCard, setIsAddingCard] = useState(false);
   const [isLoadingScreenshot, setIsLoadingScreenshot] = useState(false);
   const [ankiStatus, setAnkiStatus] = useState<"unknown" | "connected" | "disconnected">("unknown");
-  const [serviceStatus, setServiceStatus] = useState<string>("unknown");
   const [isCheckingStatus, setIsCheckingStatus] = useState(false);
   const [isLaunchingAnki, setIsLaunchingAnki] = useState(false);
 
   const onCheckAnkiStatus = () => {
     setIsCheckingStatus(true);
-    Promise.all([
-      checkAnkiConnection()
-        .then((connected) => setAnkiStatus(connected ? "connected" : "disconnected"))
-        .catch((e) => {
-          console.error("[AnkiCards] check_anki_connection failed:", e);
-          setAnkiStatus("disconnected");
-        }),
-      checkAnkiServiceStatus()
-        .then((status) => setServiceStatus(status))
-        .catch((e) => {
-          console.error("[AnkiCards] check_anki_service_status failed:", e);
-          setServiceStatus("unknown");
-        }),
-    ]).finally(() => setIsCheckingStatus(false));
+    checkAnkiConnection()
+      .then((connected) => setAnkiStatus(connected ? "connected" : "disconnected"))
+      .catch((e) => {
+        console.error("[AnkiCards] check_anki_connection failed:", e);
+        setAnkiStatus("disconnected");
+      })
+      .finally(() => setIsCheckingStatus(false));
   };
 
   // Refresh status whenever this tab (re)mounts, including the QAM's remount-on-dropdown-close
@@ -170,10 +166,6 @@ function Content() {
     setImagePreviewUrl("");
   };
 
-  const setLanguage = (value: string) => {
-    cache.language = value;
-    setLanguageState(value);
-  };
   const setMorph = (value: string) => {
     cache.morph = value;
     setMorphState(value);
@@ -181,6 +173,14 @@ function Content() {
   const setDefinition = (value: string) => {
     cache.definition = value;
     setDefinitionState(value);
+  };
+  const setOriginLanguage = (value: string) => {
+    cache.originLanguage = value;
+    setOriginLanguageState(value);
+  };
+  const setTargetLanguage = (value: string) => {
+    cache.targetLanguage = value;
+    setTargetLanguageState(value);
   };
   const setImage = (value: string) => {
     cache.image = value;
@@ -195,24 +195,28 @@ function Content() {
     setAudioState(value);
   };
 
-  const languageOptions: DropdownOption[] = LANGUAGES.map((lang) => ({ data: lang, label: lang }));
+  const languageOptions: DropdownOption[] = LANGUAGE_OPTIONS.map((lang) => ({ data: lang, label: lang }));
 
   const extractOptionValue = (option: DropdownOption): string => {
     return option && typeof option === "object" && "data" in option ? option.data : (option as unknown as string);
   };
 
-  const onLanguageChange = (option: DropdownOption) => {
-    setLanguage(extractOptionValue(option));
+  const onOriginLanguageChange = (option: DropdownOption) => {
+    setOriginLanguage(extractOptionValue(option));
+  };
+
+  const onTargetLanguageChange = (option: DropdownOption) => {
+    setTargetLanguage(extractOptionValue(option));
   };
 
   const onCreateDeck = () => {
     setIsCreatingDeck(true);
-    createDeckForLanguage(language)
+    createDeck()
       .then((deckName) => {
         toaster.toast({ title: "Deck ready", body: deckName });
       })
       .catch((e) => {
-        console.error("[AnkiCards] create_deck_for_language failed:", e);
+        console.error("[AnkiCards] create_deck failed:", e);
         toaster.toast({ title: "Could not create deck", body: String(e) });
       })
       .finally(() => setIsCreatingDeck(false));
@@ -220,9 +224,9 @@ function Content() {
 
   const onAddCard = () => {
     setIsAddingCard(true);
-    addNote(language, morph, definition, image, audio)
+    addNote(morph, definition, image, audio)
       .then((noteId) => {
-        toaster.toast({ title: "Card added", body: `Note ${noteId} added to ${deckNameForLanguage(language)}` });
+        toaster.toast({ title: "Card added", body: `Note ${noteId} added to ${DECK_NAME}` });
         setMorph("");
         setDefinition("");
         setImage("");
@@ -238,6 +242,8 @@ function Content() {
 
   const ankiStatusGlyph = ankiStatus === "connected" ? "✓" : ankiStatus === "disconnected" ? "✗" : "…";
   const ankiStatusColor = ankiStatus === "connected" ? "#2ecc71" : ankiStatus === "disconnected" ? "#e74c3c" : "#888";
+
+  const compactButtonStyle = { flex: 1, minWidth: 0, fontSize: "12px", padding: "6px 4px" };
 
   return (
     <>
@@ -263,9 +269,6 @@ function Content() {
         </Field>
       </PanelSectionRow>
       <PanelSectionRow>
-        <Field label="Background service">{serviceStatus}</Field>
-      </PanelSectionRow>
-      <PanelSectionRow>
         <ButtonItem
           layout="below"
           disabled={isCheckingStatus}
@@ -285,24 +288,20 @@ function Content() {
           Open Anki
         </ButtonItem>
       </PanelSectionRow>
+      <PanelSectionRow>
+        <div style={{ fontSize: "11px", opacity: 0.6, padding: "2px 0" }}>
+          Opens Anki in a second window, switching away from your game.
+        </div>
+      </PanelSectionRow>
     </PanelSection>
     <PanelSection title="New Card">
       <PanelSectionRow>
-        <DropdownItem
-          label="Language"
-          rgOptions={languageOptions}
-          selectedOption={language}
-          onChange={onLanguageChange}
-          strDefaultLabel="Select a language"
-        />
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <Field label="Deck">{language ? deckNameForLanguage(language) : "(select a language)"}</Field>
+        <Field label="Deck">{DECK_NAME}</Field>
       </PanelSectionRow>
       <PanelSectionRow>
         <ButtonItem
           layout="below"
-          disabled={!language || isCreatingDeck}
+          disabled={isCreatingDeck}
           onClick={onCreateDeck}
         >
           Create Deck
@@ -323,32 +322,46 @@ function Content() {
         />
       </PanelSectionRow>
       <PanelSectionRow>
-        {imagePreviewUrl ? (
+        <DropdownItem
+          label="From"
+          rgOptions={languageOptions}
+          selectedOption={originLanguage}
+          onChange={onOriginLanguageChange}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <DropdownItem
+          label="To"
+          rgOptions={languageOptions}
+          selectedOption={targetLanguage}
+          onChange={onTargetLanguageChange}
+        />
+      </PanelSectionRow>
+      {imagePreviewUrl && (
+        <PanelSectionRow>
           <img
             src={imagePreviewUrl}
             style={{ width: "100%", borderRadius: "4px", display: "block" }}
           />
-        ) : (
-          <Field label="Image">No image selected</Field>
-        )}
-      </PanelSectionRow>
+        </PanelSectionRow>
+      )}
       <PanelSectionRow>
-        <ButtonItem
-          layout="below"
-          disabled={isLoadingScreenshot}
-          onClick={onTakeScreenshot}
-        >
-          {imagePreviewUrl ? "Retake (use last screenshot)" : "Take (use last screenshot)"}
-        </ButtonItem>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <ButtonItem
-          layout="below"
-          disabled={!imagePreviewUrl}
-          onClick={onDeleteImage}
-        >
-          Delete Image
-        </ButtonItem>
+        <Focusable style={{ display: "flex", gap: "8px" }}>
+          <DialogButton
+            disabled={isLoadingScreenshot}
+            onClick={onTakeScreenshot}
+            style={compactButtonStyle}
+          >
+            {imagePreviewUrl ? "Retake" : "Take Image"}
+          </DialogButton>
+          <DialogButton
+            disabled={!imagePreviewUrl}
+            onClick={onDeleteImage}
+            style={compactButtonStyle}
+          >
+            Delete
+          </DialogButton>
+        </Focusable>
       </PanelSectionRow>
       <PanelSectionRow>
         <TextField
@@ -360,7 +373,7 @@ function Content() {
       <PanelSectionRow>
         <ButtonItem
           layout="below"
-          disabled={!language || !morph || isAddingCard}
+          disabled={!morph || isAddingCard}
           onClick={onAddCard}
         >
           Add Card

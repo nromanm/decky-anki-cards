@@ -45,8 +45,7 @@ def _ankiconnect_request(action: str, params: dict = None, version: int = 6):
         raise Exception(body["error"])
     return body["result"]
 
-def _deck_name_for_language(language: str) -> str:
-    return f"Decky Anki Plugin Deck ({language})"
+DECK_NAME = "Decky Anki Plugin Deck"
 
 # Builds an AnkiConnect picture/audio media entry from a user-typed path or URL, or None if
 # empty. AnkiConnect distinguishes remote vs local media by which param is set: `url` for
@@ -132,31 +131,29 @@ class Plugin:
                 ],
             })
 
-    # Creates (or reuses, if already present) the plugin's per-language deck and shared note
-    # type. Requires Anki running with AnkiConnect installed.
-    async def create_deck_for_language(self, language: str) -> str:
+    # Creates (or reuses, if already present) the plugin's single deck and shared note type.
+    # Requires Anki running with AnkiConnect installed.
+    async def create_deck(self) -> str:
         loop = asyncio.get_event_loop()
         try:
-            deck_name = _deck_name_for_language(language)
-            await self._ensure_deck_and_model(loop, deck_name)
-            decky.logger.info(f"create_deck_for_language: ensured deck {deck_name!r} and note type {NOTE_TYPE_NAME!r}")
-            return deck_name
+            await self._ensure_deck_and_model(loop, DECK_NAME)
+            decky.logger.info(f"create_deck: ensured deck {DECK_NAME!r} and note type {NOTE_TYPE_NAME!r}")
+            return DECK_NAME
         except (urllib.error.URLError, ConnectionError) as e:
             decky.logger.error(f"Could not reach AnkiConnect at {ANKICONNECT_URL}: {e}")
             raise Exception(f"Could not reach AnkiConnect. Is Anki running with AnkiConnect installed? ({e})")
 
-    # Adds a note to the language's deck, creating the deck/note type first if needed. Image and
+    # Adds a note to the plugin's deck, creating the deck/note type first if needed. Image and
     # audio are AnkiConnect media refs (path or URL), not raw field text.
-    async def add_note(self, language: str, morph: str, definition: str, image: str, audio: str) -> int:
+    async def add_note(self, morph: str, definition: str, image: str, audio: str) -> int:
         loop = asyncio.get_event_loop()
         try:
             if not morph or not morph.strip():
                 raise Exception("Morph is required.")
-            deck_name = _deck_name_for_language(language)
-            await self._ensure_deck_and_model(loop, deck_name)
+            await self._ensure_deck_and_model(loop, DECK_NAME)
 
             note = {
-                "deckName": deck_name,
+                "deckName": DECK_NAME,
                 "modelName": NOTE_TYPE_NAME,
                 "fields": {
                     "Morph": morph,
@@ -175,7 +172,7 @@ class Plugin:
                 note["audio"] = [audio_entry]
 
             note_id = await loop.run_in_executor(None, _ankiconnect_request, "addNote", {"note": note})
-            decky.logger.info(f"add_note: added note {note_id} to deck {deck_name!r}")
+            decky.logger.info(f"add_note: added note {note_id} to deck {DECK_NAME!r}")
 
             # AnkiConnect has already copied the image into Anki's own media collection at this
             # point, so the local source file (if it was a local path, not a URL) is redundant —
