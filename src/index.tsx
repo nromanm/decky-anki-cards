@@ -20,6 +20,9 @@ import { FaShip } from "react-icons/fa";
 
 const checkAnkiConnection = callable<[], boolean>("check_anki_connection");
 const getImagePreview = callable<[path: string], string>("get_image_preview");
+const getAudioPreview = callable<[path: string], string>("get_audio_preview");
+const takeLastRecordingAudio = callable<[], { path: string; duration: number | null }>("take_last_recording_audio");
+const discardAudioFile = callable<[path: string], void>("discard_audio_file");
 const createDeck = callable<[], string>("create_deck");
 const addNote = callable<[morph: string, definition: string, image: string, audio: string], number>("add_note");
 
@@ -102,6 +105,8 @@ const cache = {
   image: "",
   imagePreviewUrl: "",
   audio: "",
+  audioPreviewUrl: "",
+  audioDuration: null as number | null,
 };
 
 function Content() {
@@ -112,8 +117,11 @@ function Content() {
   const [image, setImageState] = useState(cache.image);
   const [imagePreviewUrl, setImagePreviewUrlState] = useState(cache.imagePreviewUrl);
   const [audio, setAudioState] = useState(cache.audio);
+  const [audioPreviewUrl, setAudioPreviewUrlState] = useState(cache.audioPreviewUrl);
+  const [audioDuration, setAudioDurationState] = useState(cache.audioDuration);
   const [isCreatingDeck, setIsCreatingDeck] = useState(false);
   const [isAddingCard, setIsAddingCard] = useState(false);
+  const [isLoadingAudio, setIsLoadingAudio] = useState(false);
   const [isLoadingScreenshot, setIsLoadingScreenshot] = useState(false);
   const [ankiStatus, setAnkiStatus] = useState<"unknown" | "connected" | "disconnected">("unknown");
   const [isCheckingStatus, setIsCheckingStatus] = useState(false);
@@ -166,6 +174,42 @@ function Content() {
     setImagePreviewUrl("");
   };
 
+  // Each take produces its own temp file on the backend — discard whatever was taken before
+  // (if anything) so Retake/Delete don't leak it under the system temp directory.
+  const discardPreviousAudio = () => {
+    if (!audio) {
+      return Promise.resolve();
+    }
+    const previous = audio;
+    return discardAudioFile(previous).catch((e) => {
+      console.error("[AnkiCards] discardAudioFile failed:", e);
+    });
+  };
+
+  const onTakeAudio = () => {
+    setIsLoadingAudio(true);
+    discardPreviousAudio()
+      .then(() => takeLastRecordingAudio())
+      .then(({ path, duration }) => {
+        setAudio(path);
+        setAudioDuration(duration);
+        return getAudioPreview(path);
+      })
+      .then((previewUrl) => setAudioPreviewUrl(previewUrl))
+      .catch((e) => {
+        console.error("[AnkiCards] onTakeAudio failed:", e);
+        toaster.toast({ title: "Could not get recording audio", body: String(e) });
+      })
+      .finally(() => setIsLoadingAudio(false));
+  };
+
+  const onDeleteAudio = () => {
+    discardPreviousAudio();
+    setAudio("");
+    setAudioPreviewUrl("");
+    setAudioDuration(null);
+  };
+
   const setMorph = (value: string) => {
     cache.morph = value;
     setMorphState(value);
@@ -193,6 +237,14 @@ function Content() {
   const setAudio = (value: string) => {
     cache.audio = value;
     setAudioState(value);
+  };
+  const setAudioPreviewUrl = (value: string) => {
+    cache.audioPreviewUrl = value;
+    setAudioPreviewUrlState(value);
+  };
+  const setAudioDuration = (value: number | null) => {
+    cache.audioDuration = value;
+    setAudioDurationState(value);
   };
 
   const languageOptions: DropdownOption[] = LANGUAGE_OPTIONS.map((lang) => ({ data: lang, label: lang }));
@@ -232,6 +284,8 @@ function Content() {
         setImage("");
         setImagePreviewUrl("");
         setAudio("");
+        setAudioPreviewUrl("");
+        setAudioDuration(null);
       })
       .catch((e) => {
         console.error("[AnkiCards] add_note failed:", e);
@@ -337,6 +391,8 @@ function Content() {
           onChange={onTargetLanguageChange}
         />
       </PanelSectionRow>
+    </PanelSection>
+    <PanelSection title="Image">
       {imagePreviewUrl && (
         <PanelSectionRow>
           <img
@@ -352,7 +408,7 @@ function Content() {
             onClick={onTakeScreenshot}
             style={compactButtonStyle}
           >
-            {imagePreviewUrl ? "Retake" : "Take Image"}
+            {imagePreviewUrl ? "Retake" : "Take"}
           </DialogButton>
           <DialogButton
             disabled={!imagePreviewUrl}
@@ -363,13 +419,57 @@ function Content() {
           </DialogButton>
         </Focusable>
       </PanelSectionRow>
+      {!imagePreviewUrl && (
+        <PanelSectionRow>
+          <div style={{ fontSize: "11px", opacity: 0.6, padding: "2px 0" }}>
+            Uses your last Steam screenshot (Steam + R1) — take one, then tap Take.
+          </div>
+        </PanelSectionRow>
+      )}
+    </PanelSection>
+    <PanelSection title="Audio">
+      {audioPreviewUrl && (
+        <PanelSectionRow>
+          <audio
+            controls
+            src={audioPreviewUrl}
+            style={{ width: "100%", display: "block" }}
+          />
+        </PanelSectionRow>
+      )}
+      {audio && (
+        <PanelSectionRow>
+          <Field label="Length">{audioDuration !== null ? `${audioDuration.toFixed(1)}s` : "unknown"}</Field>
+        </PanelSectionRow>
+      )}
       <PanelSectionRow>
-        <TextField
-          label="Audio (file path or URL)"
-          value={audio}
-          onChange={(e) => setAudio(e.target.value)}
-        />
+        <Focusable style={{ display: "flex", gap: "8px" }}>
+          <DialogButton
+            disabled={isLoadingAudio}
+            onClick={onTakeAudio}
+            style={compactButtonStyle}
+          >
+            {audio ? "Retake" : "Take"}
+          </DialogButton>
+          <DialogButton
+            disabled={!audio}
+            onClick={onDeleteAudio}
+            style={compactButtonStyle}
+          >
+            Delete
+          </DialogButton>
+        </Focusable>
       </PanelSectionRow>
+      {!audio && (
+        <PanelSectionRow>
+          <div style={{ fontSize: "11px", opacity: 0.6, padding: "2px 0" }}>
+            Needs "Record In Background" on (Settings &gt; System &gt; Recording) and a saved
+            clip — save one, then tap Take.
+          </div>
+        </PanelSectionRow>
+      )}
+    </PanelSection>
+    <PanelSection title="Add Card">
       <PanelSectionRow>
         <ButtonItem
           layout="below"
