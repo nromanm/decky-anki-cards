@@ -1,7 +1,7 @@
 import {
   ButtonItem,
   DialogButton,
-  DropdownItem,
+  Dropdown,
   DropdownOption,
   Field,
   Focusable,
@@ -23,8 +23,9 @@ const getImagePreview = callable<[path: string], string>("get_image_preview");
 const getAudioPreview = callable<[path: string], string>("get_audio_preview");
 const takeLastRecordingAudio = callable<[], { path: string; duration: number | null }>("take_last_recording_audio");
 const discardAudioFile = callable<[path: string], void>("discard_audio_file");
+const ocrScreenshot = callable<[path: string, language: string], string>("ocr_screenshot");
 const createDeck = callable<[], string>("create_deck");
-const addNote = callable<[morph: string, definition: string, image: string, audio: string], number>("add_note");
+const addNote = callable<[morph: string, definition: string, example: string, translation: string, image: string, audio: string], number>("add_note");
 
 const DECK_NAME = "Decky Anki Plugin Deck";
 
@@ -100,6 +101,8 @@ async function useLastScreenshotPath(): Promise<string> {
 const cache = {
   morph: "",
   definition: "",
+  example: "",
+  translation: "",
   originLanguage: "Japanese",
   targetLanguage: "English",
   image: "",
@@ -112,6 +115,9 @@ const cache = {
 function Content() {
   const [morph, setMorphState] = useState(cache.morph);
   const [definition, setDefinitionState] = useState(cache.definition);
+  const [example, setExampleState] = useState(cache.example);
+  const [translation, setTranslationState] = useState(cache.translation);
+  const [isRunningOcr, setIsRunningOcr] = useState(false);
   const [originLanguage, setOriginLanguageState] = useState(cache.originLanguage);
   const [targetLanguage, setTargetLanguageState] = useState(cache.targetLanguage);
   const [image, setImageState] = useState(cache.image);
@@ -174,6 +180,30 @@ function Content() {
     setImagePreviewUrl("");
   };
 
+  const onRunOcr = () => {
+    console.log("[AnkiCards] onRunOcr: running OCR on", image, "lang", originLanguage);
+    setIsRunningOcr(true);
+    ocrScreenshot(image, originLanguage)
+      .then((text) => {
+        console.log("[AnkiCards] onRunOcr: result:", JSON.stringify(text));
+        setExample(text);
+        toaster.toast({
+          title: text ? "OCR done" : "No text found",
+          body: text ? text.slice(0, 80) : "Tesseract didn't recognize any text in that image.",
+        });
+      })
+      .catch((e) => {
+        console.error("[AnkiCards] ocrScreenshot failed:", e);
+        toaster.toast({ title: "Could not read text from image", body: String(e) });
+      })
+      .finally(() => setIsRunningOcr(false));
+  };
+
+  // Placeholder — real translation (Example -> Translation, using From/To) is a future feature.
+  const onTranslate = () => {
+    toaster.toast({ title: "Not implemented yet", body: "Auto-translate is coming in a future update." });
+  };
+
   // Each take produces its own temp file on the backend — discard whatever was taken before
   // (if anything) so Retake/Delete don't leak it under the system temp directory.
   const discardPreviousAudio = () => {
@@ -217,6 +247,14 @@ function Content() {
   const setDefinition = (value: string) => {
     cache.definition = value;
     setDefinitionState(value);
+  };
+  const setExample = (value: string) => {
+    cache.example = value;
+    setExampleState(value);
+  };
+  const setTranslation = (value: string) => {
+    cache.translation = value;
+    setTranslationState(value);
   };
   const setOriginLanguage = (value: string) => {
     cache.originLanguage = value;
@@ -276,11 +314,13 @@ function Content() {
 
   const onAddCard = () => {
     setIsAddingCard(true);
-    addNote(morph, definition, image, audio)
+    addNote(morph, definition, example, translation, image, audio)
       .then((noteId) => {
         toaster.toast({ title: "Card added", body: `Note ${noteId} added to ${DECK_NAME}` });
         setMorph("");
         setDefinition("");
+        setExample("");
+        setTranslation("");
         setImage("");
         setImagePreviewUrl("");
         setAudio("");
@@ -363,36 +403,40 @@ function Content() {
       </PanelSectionRow>
       <PanelSectionRow>
         <TextField
-          label="Morph *"
+          label="Front *"
           value={morph}
           onChange={(e) => setMorph(e.target.value)}
         />
       </PanelSectionRow>
       <PanelSectionRow>
         <TextField
-          label="Definition / Translation"
+          label="Back"
           value={definition}
           onChange={(e) => setDefinition(e.target.value)}
         />
       </PanelSectionRow>
-      <PanelSectionRow>
-        <DropdownItem
-          label="From"
-          rgOptions={languageOptions}
-          selectedOption={originLanguage}
-          onChange={onOriginLanguageChange}
-        />
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <DropdownItem
-          label="To"
-          rgOptions={languageOptions}
-          selectedOption={targetLanguage}
-          onChange={onTargetLanguageChange}
-        />
-      </PanelSectionRow>
     </PanelSection>
-    <PanelSection title="Image">
+    <PanelSection title="Image & Example">
+      <PanelSectionRow>
+        <Focusable style={{ display: "flex", gap: "8px" }}>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: "11px", opacity: 0.6, marginBottom: "2px" }}>From</div>
+            <Dropdown
+              rgOptions={languageOptions}
+              selectedOption={originLanguage}
+              onChange={onOriginLanguageChange}
+            />
+          </div>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: "11px", opacity: 0.6, marginBottom: "2px" }}>To</div>
+            <Dropdown
+              rgOptions={languageOptions}
+              selectedOption={targetLanguage}
+              onChange={onTargetLanguageChange}
+            />
+          </div>
+        </Focusable>
+      </PanelSectionRow>
       {imagePreviewUrl && (
         <PanelSectionRow>
           <img
@@ -426,6 +470,43 @@ function Content() {
           </div>
         </PanelSectionRow>
       )}
+      <PanelSectionRow>
+        <DialogButton
+          disabled={!image || isRunningOcr}
+          onClick={onRunOcr}
+          style={compactButtonStyle}
+        >
+          OCR from Image
+        </DialogButton>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <div style={{ fontSize: "11px", opacity: 0.6, padding: "2px 0" }}>
+          OCR text may not be fully accurate — check it before adding the card.
+        </div>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <TextField
+          label="Example"
+          value={example}
+          onChange={(e) => setExample(e.target.value)}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <DialogButton
+          disabled
+          onClick={onTranslate}
+          style={compactButtonStyle}
+        >
+          Translate (coming soon)
+        </DialogButton>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <TextField
+          label="Translation"
+          value={translation}
+          onChange={(e) => setTranslation(e.target.value)}
+        />
+      </PanelSectionRow>
     </PanelSection>
     <PanelSection title="Audio">
       {audioPreviewUrl && (

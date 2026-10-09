@@ -14,7 +14,7 @@ pnpm run build
 
 ssh "$DECK_HOST" "rm -rf '$REMOTE_TMP' && mkdir -p '$REMOTE_TMP'"
 rsync -az --delete \
-  dist main.py package.json plugin.json py_modules README.md LICENSE \
+  dist main.py package.json plugin.json py_modules bin README.md LICENSE \
   "$DECK_HOST:$REMOTE_TMP/"
 
 ssh "$DECK_HOST" "echo '$DECK_PASS' | sudo -S bash -c '

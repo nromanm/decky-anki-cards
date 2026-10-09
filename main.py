@@ -23,7 +23,7 @@ ANKICONNECT_URL = "http://127.0.0.1:8765"
 ANKI_SERVICE_UNIT = "anki-background.service"
 
 NOTE_TYPE_NAME = "Decky Anki Plugin Note Type"
-NOTE_TYPE_FIELDS = ["Morph", "Definition/Translation", "Image", "Audio"]
+NOTE_TYPE_FIELDS = ["Morph", "Definition/Translation", "Example", "Translation", "Image", "Audio"]
 NOTE_TYPE_CSS = (
     ".card {\n"
     " font-family: arial;\n"
@@ -36,8 +36,32 @@ NOTE_TYPE_CSS = (
 NOTE_TYPE_FRONT_TEMPLATE = "{{Morph}}"
 NOTE_TYPE_BACK_TEMPLATE = (
     "{{FrontSide}}\n\n<hr id=\"answer\">\n\n"
-    "{{Definition/Translation}}\n\n{{Image}}\n\n{{Audio}}"
+    "{{Definition/Translation}}\n\n{{Example}}\n\n{{Translation}}\n\n{{Image}}\n\n{{Audio}}"
 )
+
+# Bundled Tesseract OCR (bin/tesseract, static/musl build — see bin/NOTICE.md) and its
+# tessdata_fast language files (bin/tessdata/), used to fill the "Example" field from whatever
+# screenshot is currently set as the Image. Low-resource by design: a short-lived subprocess
+# rather than a resident service, ~100-300MB peak RAM and well under a second per screenshot.
+PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+TESSERACT_BIN = os.path.join(PLUGIN_DIR, "bin", "tesseract")
+TESSDATA_DIR = os.path.join(PLUGIN_DIR, "bin", "tessdata")
+
+# Maps this plugin's language-selector display names (src/index.tsx LANGUAGE_OPTIONS) to
+# Tesseract language codes / tessdata_fast filenames. Falls back to English for anything unmapped.
+OCR_LANGUAGE_CODES = {
+    "Japanese": "jpn",
+    "English": "eng",
+    "Spanish": "spa",
+    "French": "fra",
+    "German": "deu",
+    "Korean": "kor",
+    "Mandarin Chinese": "chi_sim",
+    "Italian": "ita",
+    "Portuguese": "por",
+    "Russian": "rus",
+    "Arabic": "ara",
+}
 
 def _ankiconnect_request(action: str, params: dict = None, version: int = 6):
     payload = json.dumps({"action": action, "version": version, "params": params or {}}).encode("utf-8")
@@ -179,6 +203,37 @@ class Plugin:
             decky.logger.error(f"get_audio_preview: could not read {path!r}: {e}")
             raise Exception(f"Could not load audio preview: {e}")
 
+    # Runs the bundled Tesseract OCR over the given screenshot (whatever path the Image section
+    # currently has — this doesn't re-fetch anything itself) and returns the recognized text for
+    # the "Example" field. `language` is the plugin's own display name (e.g. "Japanese"), mapped
+    # to a Tesseract language code; unmapped values fall back to English.
+    async def ocr_screenshot(self, path: str, language: str) -> str:
+        loop = asyncio.get_event_loop()
+
+        def _run():
+            # Best-effort: the deployed binary is already executable (root-owned via
+            # scripts/deploy.sh), and this backend runs as a non-root user, so it can't chmod a
+            # file it doesn't own — EPERM here just means it was already fine.
+            try:
+                os.chmod(TESSERACT_BIN, 0o755)
+            except OSError:
+                pass
+            lang_code = OCR_LANGUAGE_CODES.get(language, "eng")
+            result = subprocess.run(
+                [TESSERACT_BIN, path, "stdout", "-l", lang_code, "--tessdata-dir", TESSDATA_DIR],
+                capture_output=True, text=True, timeout=15, check=True,
+            )
+            return result.stdout.strip()
+
+        try:
+            return await loop.run_in_executor(None, _run)
+        except subprocess.CalledProcessError as e:
+            decky.logger.error(f"ocr_screenshot: tesseract failed: {e.stderr}")
+            raise Exception("Could not read text from that screenshot.")
+        except Exception as e:
+            decky.logger.error(f"ocr_screenshot: {e}")
+            raise Exception(str(e))
+
     # Extracts just the audio track from the most recently saved Steam "Record In Background"
     # clip (Settings > System > Recording must be on, then save a clip with its hotkey) —
     # analogous to the Image field's screenshot capture, but clips aren't exposed through a
@@ -282,6 +337,19 @@ class Plugin:
                     {"Name": "Card 1", "Front": NOTE_TYPE_FRONT_TEMPLATE, "Back": NOTE_TYPE_BACK_TEMPLATE},
                 ],
             })
+        else:
+            # Migration for note types created before later fields (Example, Translation, ...)
+            # existed. Adds whatever's missing, in NOTE_TYPE_FIELDS order, at its intended index.
+            existing_fields = await loop.run_in_executor(
+                None, _ankiconnect_request, "modelFieldNames", {"modelName": NOTE_TYPE_NAME})
+            for index, field_name in enumerate(NOTE_TYPE_FIELDS):
+                if field_name not in existing_fields:
+                    await loop.run_in_executor(None, _ankiconnect_request, "modelFieldAdd", {
+                        "modelName": NOTE_TYPE_NAME,
+                        "fieldName": field_name,
+                        "index": index,
+                    })
+                    existing_fields.insert(index, field_name)
 
     # Creates (or reuses, if already present) the plugin's single deck and shared note type.
     # Requires Anki running with AnkiConnect installed.
@@ -297,7 +365,7 @@ class Plugin:
 
     # Adds a note to the plugin's deck, creating the deck/note type first if needed. Image and
     # audio are AnkiConnect media refs (path or URL), not raw field text.
-    async def add_note(self, morph: str, definition: str, image: str, audio: str) -> int:
+    async def add_note(self, morph: str, definition: str, example: str, translation: str, image: str, audio: str) -> int:
         loop = asyncio.get_event_loop()
         try:
             if not morph or not morph.strip():
@@ -310,6 +378,8 @@ class Plugin:
                 "fields": {
                     "Morph": morph,
                     "Definition/Translation": definition,
+                    "Example": example,
+                    "Translation": translation,
                     "Image": "",
                     "Audio": "",
                 },
