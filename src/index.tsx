@@ -7,7 +7,9 @@ import {
   Focusable,
   PanelSection,
   PanelSectionRow,
+  SliderField,
   TextField,
+  ToggleField,
   staticClasses
 } from "@decky/ui";
 import {
@@ -23,9 +25,10 @@ const getImagePreview = callable<[path: string], string>("get_image_preview");
 const getAudioPreview = callable<[path: string], string>("get_audio_preview");
 const takeLastRecordingAudio = callable<[], { path: string; duration: number | null }>("take_last_recording_audio");
 const discardAudioFile = callable<[path: string], void>("discard_audio_file");
-const ocrScreenshot = callable<[path: string, language: string], string>("ocr_screenshot");
+const ocrScreenshot = callable<[path: string, language: string, cropTop: number, cropLeft: number, cropRight: number, cropBottom: number], string>("ocr_screenshot");
 const createDeck = callable<[], string>("create_deck");
 const addNote = callable<[morph: string, definition: string, example: string, translation: string, image: string, audio: string], number>("add_note");
+const translateText = callable<[text: string, sourceLanguage: string, targetLanguage: string], string>("translate_text");
 
 const DECK_NAME = "Decky Anki Plugin Deck";
 
@@ -110,6 +113,11 @@ const cache = {
   audio: "",
   audioPreviewUrl: "",
   audioDuration: null as number | null,
+  cropTop: 0,
+  cropLeft: 0,
+  cropRight: 0,
+  cropBottom: 0,
+  cropEnabled: false,
 };
 
 function Content() {
@@ -118,6 +126,7 @@ function Content() {
   const [example, setExampleState] = useState(cache.example);
   const [translation, setTranslationState] = useState(cache.translation);
   const [isRunningOcr, setIsRunningOcr] = useState(false);
+  const [isTranslating, setIsTranslating] = useState(false);
   const [originLanguage, setOriginLanguageState] = useState(cache.originLanguage);
   const [targetLanguage, setTargetLanguageState] = useState(cache.targetLanguage);
   const [image, setImageState] = useState(cache.image);
@@ -125,6 +134,11 @@ function Content() {
   const [audio, setAudioState] = useState(cache.audio);
   const [audioPreviewUrl, setAudioPreviewUrlState] = useState(cache.audioPreviewUrl);
   const [audioDuration, setAudioDurationState] = useState(cache.audioDuration);
+  const [cropTop, setCropTopState] = useState(cache.cropTop);
+  const [cropLeft, setCropLeftState] = useState(cache.cropLeft);
+  const [cropRight, setCropRightState] = useState(cache.cropRight);
+  const [cropBottom, setCropBottomState] = useState(cache.cropBottom);
+  const [cropEnabled, setCropEnabledState] = useState(cache.cropEnabled);
   const [isCreatingDeck, setIsCreatingDeck] = useState(false);
   const [isAddingCard, setIsAddingCard] = useState(false);
   const [isLoadingAudio, setIsLoadingAudio] = useState(false);
@@ -183,7 +197,14 @@ function Content() {
   const onRunOcr = () => {
     console.log("[AnkiCards] onRunOcr: running OCR on", image, "lang", originLanguage);
     setIsRunningOcr(true);
-    ocrScreenshot(image, originLanguage)
+    ocrScreenshot(
+      image,
+      originLanguage,
+      cropEnabled ? cropTop : 0,
+      cropEnabled ? cropLeft : 0,
+      cropEnabled ? cropRight : 0,
+      cropEnabled ? cropBottom : 0,
+    )
       .then((text) => {
         console.log("[AnkiCards] onRunOcr: result:", JSON.stringify(text));
         setExample(text);
@@ -199,9 +220,15 @@ function Content() {
       .finally(() => setIsRunningOcr(false));
   };
 
-  // Placeholder — real translation (Example -> Translation, using From/To) is a future feature.
   const onTranslate = () => {
-    toaster.toast({ title: "Not implemented yet", body: "Auto-translate is coming in a future update." });
+    setIsTranslating(true);
+    translateText(example, originLanguage, targetLanguage)
+      .then((text) => setTranslation(text))
+      .catch((e) => {
+        console.error("[AnkiCards] translateText failed:", e);
+        toaster.toast({ title: "Could not translate", body: String(e) });
+      })
+      .finally(() => setIsTranslating(false));
   };
 
   // Each take produces its own temp file on the backend — discard whatever was taken before
@@ -284,6 +311,26 @@ function Content() {
     cache.audioDuration = value;
     setAudioDurationState(value);
   };
+  const setCropTop = (value: number) => {
+    cache.cropTop = value;
+    setCropTopState(value);
+  };
+  const setCropLeft = (value: number) => {
+    cache.cropLeft = value;
+    setCropLeftState(value);
+  };
+  const setCropRight = (value: number) => {
+    cache.cropRight = value;
+    setCropRightState(value);
+  };
+  const setCropBottom = (value: number) => {
+    cache.cropBottom = value;
+    setCropBottomState(value);
+  };
+  const setCropEnabled = (value: boolean) => {
+    cache.cropEnabled = value;
+    setCropEnabledState(value);
+  };
 
   const languageOptions: DropdownOption[] = LANGUAGE_OPTIONS.map((lang) => ({ data: lang, label: lang }));
 
@@ -338,6 +385,12 @@ function Content() {
   const ankiStatusColor = ankiStatus === "connected" ? "#2ecc71" : ankiStatus === "disconnected" ? "#e74c3c" : "#888";
 
   const compactButtonStyle = { flex: 1, minWidth: 0, fontSize: "12px", padding: "6px 4px" };
+
+  const divider = (
+    <PanelSectionRow>
+      <div style={{ borderTop: "1px solid rgba(255, 255, 255, 0.15)", margin: "6px 0" }} />
+    </PanelSectionRow>
+  );
 
   return (
     <>
@@ -401,6 +454,7 @@ function Content() {
           Create Deck
         </ButtonItem>
       </PanelSectionRow>
+      {divider}
       <PanelSectionRow>
         <TextField
           label="Front *"
@@ -408,6 +462,7 @@ function Content() {
           onChange={(e) => setMorph(e.target.value)}
         />
       </PanelSectionRow>
+      {divider}
       <PanelSectionRow>
         <TextField
           label="Back"
@@ -417,6 +472,7 @@ function Content() {
       </PanelSectionRow>
     </PanelSection>
     <PanelSection title="Image & Example">
+      {divider}
       <PanelSectionRow>
         <Focusable style={{ display: "flex", gap: "8px" }}>
           <div style={{ flex: 1 }}>
@@ -439,10 +495,20 @@ function Content() {
       </PanelSectionRow>
       {imagePreviewUrl && (
         <PanelSectionRow>
-          <img
-            src={imagePreviewUrl}
-            style={{ width: "100%", borderRadius: "4px", display: "block" }}
-          />
+          <div style={{ position: "relative" }}>
+            <img
+              src={imagePreviewUrl}
+              style={{ width: "100%", borderRadius: "4px", display: "block" }}
+            />
+            {cropEnabled && (
+              <>
+                <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: `${cropTop}%`, background: "rgba(0, 0, 0, 0.65)" }} />
+                <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, height: `${cropBottom}%`, background: "rgba(0, 0, 0, 0.65)" }} />
+                <div style={{ position: "absolute", top: `${cropTop}%`, bottom: `${cropBottom}%`, left: 0, width: `${cropLeft}%`, background: "rgba(0, 0, 0, 0.65)" }} />
+                <div style={{ position: "absolute", top: `${cropTop}%`, bottom: `${cropBottom}%`, right: 0, width: `${cropRight}%`, background: "rgba(0, 0, 0, 0.65)" }} />
+              </>
+            )}
+          </div>
         </PanelSectionRow>
       )}
       <PanelSectionRow>
@@ -470,6 +536,67 @@ function Content() {
           </div>
         </PanelSectionRow>
       )}
+      {imagePreviewUrl && (
+        <PanelSectionRow>
+          <ToggleField
+            label="Crop before OCR"
+            checked={cropEnabled}
+            onChange={setCropEnabled}
+          />
+        </PanelSectionRow>
+      )}
+      {imagePreviewUrl && cropEnabled && (
+        <>
+          <PanelSectionRow>
+            <SliderField
+              label="Crop top"
+              value={cropTop}
+              min={0}
+              max={90}
+              step={5}
+              minimumDpadGranularity={5}
+              valueSuffix="%"
+              onChange={setCropTop}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <SliderField
+              label="Crop left"
+              value={cropLeft}
+              min={0}
+              max={90}
+              step={5}
+              minimumDpadGranularity={5}
+              valueSuffix="%"
+              onChange={setCropLeft}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <SliderField
+              label="Crop right"
+              value={cropRight}
+              min={0}
+              max={90}
+              step={5}
+              minimumDpadGranularity={5}
+              valueSuffix="%"
+              onChange={setCropRight}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <SliderField
+              label="Crop bottom"
+              value={cropBottom}
+              min={0}
+              max={90}
+              step={5}
+              minimumDpadGranularity={5}
+              valueSuffix="%"
+              onChange={setCropBottom}
+            />
+          </PanelSectionRow>
+        </>
+      )}
       <PanelSectionRow>
         <DialogButton
           disabled={!image || isRunningOcr}
@@ -485,30 +612,62 @@ function Content() {
         </div>
       </PanelSectionRow>
       <PanelSectionRow>
-        <TextField
-          label="Example"
+        <div style={{ fontSize: "14px", marginBottom: "4px" }}>Example</div>
+        <textarea
           value={example}
           onChange={(e) => setExample(e.target.value)}
+          rows={5}
+          style={{
+            width: "100%",
+            minHeight: "110px",
+            resize: "vertical",
+            fontFamily: "inherit",
+            fontSize: "13px",
+            lineHeight: 1.4,
+            padding: "8px",
+            boxSizing: "border-box",
+            background: "rgba(255,255,255,0.05)",
+            color: "inherit",
+            border: "1px solid rgba(255,255,255,0.2)",
+            borderRadius: "4px",
+          }}
         />
       </PanelSectionRow>
+      {divider}
       <PanelSectionRow>
         <DialogButton
-          disabled
+          disabled={!example || isTranslating}
           onClick={onTranslate}
           style={compactButtonStyle}
         >
-          Translate (coming soon)
+          Translate
         </DialogButton>
       </PanelSectionRow>
       <PanelSectionRow>
-        <TextField
-          label="Translation"
+        <div style={{ fontSize: "14px", marginBottom: "4px" }}>Translation</div>
+        <textarea
           value={translation}
           onChange={(e) => setTranslation(e.target.value)}
+          rows={5}
+          style={{
+            width: "100%",
+            minHeight: "110px",
+            resize: "vertical",
+            fontFamily: "inherit",
+            fontSize: "13px",
+            lineHeight: 1.4,
+            padding: "8px",
+            boxSizing: "border-box",
+            background: "rgba(255,255,255,0.05)",
+            color: "inherit",
+            border: "1px solid rgba(255,255,255,0.2)",
+            borderRadius: "4px",
+          }}
         />
       </PanelSectionRow>
     </PanelSection>
     <PanelSection title="Audio">
+      {divider}
       {audioPreviewUrl && (
         <PanelSectionRow>
           <audio

@@ -6,6 +6,7 @@ import base64
 import mimetypes
 import tempfile
 import subprocess
+import ssl
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -59,6 +60,21 @@ OCR_LANGUAGE_CODES = {
     "Arabic": "ara",
 }
 
+# Same display names, mapped to Google Translate's language codes.
+TRANSLATE_LANGUAGE_CODES = {
+    "Japanese": "ja",
+    "English": "en",
+    "Spanish": "es",
+    "French": "fr",
+    "German": "de",
+    "Korean": "ko",
+    "Mandarin Chinese": "zh-CN",
+    "Italian": "it",
+    "Portuguese": "pt",
+    "Russian": "ru",
+    "Arabic": "ar",
+}
+
 def _ankiconnect_request(action: str, params: dict = None, version: int = 6):
     payload = json.dumps({"action": action, "version": version, "params": params or {}}).encode("utf-8")
     req = urllib.request.Request(ANKICONNECT_URL, data=payload, method="POST")
@@ -67,6 +83,25 @@ def _ankiconnect_request(action: str, params: dict = None, version: int = 6):
     if body.get("error") is not None:
         raise Exception(body["error"])
     return body["result"]
+
+# Google Translate's unofficial clients5 endpoint (what the Google Translate Chrome extension
+# itself calls) — free, no API key. The translate.googleapis.com?client=gtx variant (tried first)
+# got IP-throttled (HTTP 429) almost immediately on a real Deck; this one wasn't, in testing.
+# shortcut: still unofficial/no SLA, could start throttling or break the same way if Google
+# changes it — the official (API-key-based) Cloud Translation API is the fallback if so.
+# Decky Loader is a PyInstaller-frozen binary that spawns plugins under its own bundled Python +
+# OpenSSL (LD_LIBRARY_PATH points at its extracted temp dir); that bundled OpenSSL doesn't resolve
+# SteamOS's actual CA bundle on its own, so any HTTPS call here fails with CERTIFICATE_VERIFY_FAILED
+# unless we point it at the system bundle explicitly.
+_SYSTEM_CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
+
+def _google_translate(text: str, source_lang: str, target_lang: str) -> str:
+    params = urllib.parse.urlencode({"client": "dict-chrome-ex", "sl": source_lang, "tl": target_lang, "q": text})
+    req = urllib.request.Request(f"https://clients5.google.com/translate_a/t?{params}")
+    context = ssl.create_default_context(cafile=_SYSTEM_CA_BUNDLE) if os.path.exists(_SYSTEM_CA_BUNDLE) else None
+    with urllib.request.urlopen(req, timeout=10, context=context) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return data[0]
 
 DECK_NAME = "Decky Anki Plugin Deck"
 
@@ -164,6 +199,75 @@ def _ffprobe_duration(path: str):
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError, OSError):
         return None
 
+# Colored/stylized game text often has poor contrast once Tesseract reduces it to grayscale
+# (its internal luminance-weighted conversion can land a saturated color very close to the
+# background's luminance even though the color is clearly distinct to a person). No single
+# color channel is reliably best across cases — R, G and B each won on a different test image —
+# so this runs OCR once per channel and keeps whichever result Tesseract itself is most
+# confident in, via its own per-word confidence score (TSV output), rather than guessing.
+_OCR_CHANNELS = ("r", "g", "b")
+
+# Words below this are near-certainly garbage (stray symbols picked up from texture/noise) and
+# are dropped entirely rather than left in the output — confirmed against a real screenshot
+# where a channel's confident recognition of most of the screen still ended with a few such
+# words trailing off into noise.
+_OCR_MIN_WORD_CONFIDENCE = 50.0
+
+def _parse_tsv_confidence_and_text(tsv_path: str):
+    with open(tsv_path, "r", encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    words = []  # (line_key, confidence, text)
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        cols = line.split("\t")
+        if len(cols) < 12 or cols[0] != "5":  # level 5 = word-level row
+            continue
+        text = cols[11]
+        if not text.strip():
+            continue
+        try:
+            conf = float(cols[10])
+        except ValueError:
+            conf = -1.0
+        if conf < _OCR_MIN_WORD_CONFIDENCE:
+            continue
+        line_key = (cols[2], cols[3], cols[4])  # block_num, par_num, line_num
+        words.append((line_key, conf, text))
+
+    if not words:
+        return "", 0.0
+
+    lines_out = []
+    current_key, current_words = None, []
+    for line_key, _, text in words:
+        if line_key != current_key:
+            if current_words:
+                lines_out.append(" ".join(current_words))
+                # Blank line between paragraphs (not just line breaks within one), so multi-block
+                # screen text doesn't read as a single run-on paragraph.
+                if current_key is not None and (line_key[0], line_key[1]) != (current_key[0], current_key[1]):
+                    lines_out.append("")
+            current_key, current_words = line_key, []
+        current_words.append(text)
+    if current_words:
+        lines_out.append(" ".join(current_words))
+
+    # Summed, not averaged: a channel that correctly reads most of the screen must outscore one
+    # that reads only a confident fragment of it — a plain average rewards the smaller fragment
+    # whenever its words happen to score a little higher on average.
+    total_confidence = sum(conf for _, conf, _ in words)
+    return "\n".join(lines_out), total_confidence
+
+# Converts the 4 crop sliders (0-100, percent of the image to cut from that edge) into 0-1
+# fractions, clamped so at least 10% of each dimension always remains, however the sliders are set.
+def _clamp_crop_fractions(crop_top: float, crop_left: float, crop_right: float, crop_bottom: float):
+    top = max(0.0, min(crop_top, 90.0)) / 100.0
+    left = max(0.0, min(crop_left, 90.0)) / 100.0
+    right = max(0.0, min(crop_right, 90.0 - left * 100.0)) / 100.0
+    bottom = max(0.0, min(crop_bottom, 90.0 - top * 100.0)) / 100.0
+    return top, left, right, bottom
+
 class Plugin:
     # Reads a local image file and returns it as a data: URI, for the frontend to render as an
     # <img> preview. Steam's own Screenshot.strUrl isn't loadable from the plugin's content (wrong
@@ -200,10 +304,17 @@ class Plugin:
             raise Exception(f"Could not load audio preview: {e}")
 
     # Runs the bundled Tesseract OCR over the given screenshot (whatever path the Image section
-    # currently has — this doesn't re-fetch anything itself) and returns the recognized text for
-    # the "Example" field. `language` is the plugin's own display name (e.g. "Japanese"), mapped
-    # to a Tesseract language code; unmapped values fall back to English.
-    async def ocr_screenshot(self, path: str, language: str) -> str:
+    # currently has) for the "Example" field. `language` is the plugin's display name (e.g.
+    # "Japanese"), mapped to a Tesseract language code; unmapped values fall back to English.
+    # Per-channel rationale: see _OCR_CHANNELS above. crop_top/left/right/bottom (0-100, percent
+    # of the image cropped away from that edge) narrow the OCR'd area to just the text the user
+    # cares about — smaller + noisier backgrounds cropped out tends to read better, and the crop
+    # also comes out of the same 2x upscale every channel already gets, so a small cropped region
+    # ends up more magnified than the full image would.
+    async def ocr_screenshot(
+        self, path: str, language: str,
+        crop_top: float = 0.0, crop_left: float = 0.0, crop_right: float = 0.0, crop_bottom: float = 0.0,
+    ) -> str:
         loop = asyncio.get_event_loop()
 
         def _run():
@@ -215,20 +326,54 @@ class Plugin:
             except OSError:
                 pass
             lang_code = OCR_LANGUAGE_CODES.get(language, "eng")
-            result = subprocess.run(
-                [TESSERACT_BIN, path, "stdout", "-l", lang_code, "--tessdata-dir", TESSDATA_DIR],
-                capture_output=True, text=True, timeout=15, check=True,
+
+            top, left, right, bottom = _clamp_crop_fractions(crop_top, crop_left, crop_right, crop_bottom)
+            crop_filter = (
+                f"crop=iw*{1 - left - right}:ih*{1 - top - bottom}:iw*{left}:ih*{top},"
+                if (top or left or right or bottom) else ""
             )
-            return result.stdout.strip()
+
+            best_text, best_confidence = "", -1.0
+            with tempfile.TemporaryDirectory() as workdir:
+                for channel in _OCR_CHANNELS:
+                    variant_path = os.path.join(workdir, f"variant_{channel}.png")
+                    try:
+                        subprocess.run(
+                            ["ffmpeg", "-y", "-i", path,
+                             "-vf", f"{crop_filter}format=rgb24,extractplanes={channel},scale=iw*2:ih*2:flags=lanczos",
+                             variant_path],
+                            capture_output=True, timeout=15, check=True,
+                        )
+                        out_base = os.path.join(workdir, f"out_{channel}")
+                        subprocess.run(
+                            [TESSERACT_BIN, variant_path, out_base, "-l", lang_code,
+                             "--tessdata-dir", TESSDATA_DIR, "-c", "tessedit_create_tsv=1"],
+                            capture_output=True, timeout=15, check=True,
+                        )
+                        text, confidence = _parse_tsv_confidence_and_text(out_base + ".tsv")
+                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+                        decky.logger.warning(f"ocr_screenshot: channel {channel!r} failed: {e}")
+                        continue
+                    if text and confidence > best_confidence:
+                        best_text, best_confidence = text, confidence
+
+            return best_text
 
         try:
             return await loop.run_in_executor(None, _run)
-        except subprocess.CalledProcessError as e:
-            decky.logger.error(f"ocr_screenshot: tesseract failed: {e.stderr}")
-            raise Exception("Could not read text from that screenshot.")
         except Exception as e:
             decky.logger.error(f"ocr_screenshot: {e}")
             raise Exception(str(e))
+
+    async def translate_text(self, text: str, source_language: str, target_language: str) -> str:
+        loop = asyncio.get_event_loop()
+        source = TRANSLATE_LANGUAGE_CODES.get(source_language, "en")
+        target = TRANSLATE_LANGUAGE_CODES.get(target_language, "en")
+        try:
+            return await loop.run_in_executor(None, _google_translate, text, source, target)
+        except Exception as e:
+            decky.logger.error(f"translate_text: {e!r}")
+            raise Exception(f"Could not reach Google Translate: {e}")
 
     # Extracts just the audio track from the most recently saved Steam "Record In Background"
     # clip (Settings > System > Recording must be on, then save a clip with its hotkey) —
