@@ -1,5 +1,6 @@
 import os
 import re
+import html
 import json
 import glob
 import base64
@@ -95,19 +96,105 @@ def _ankiconnect_request(action: str, params: dict = None, version: int = 6):
 # unless we point it at the system bundle explicitly.
 _SYSTEM_CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
 
+def _https_context():
+    return ssl.create_default_context(cafile=_SYSTEM_CA_BUNDLE) if os.path.exists(_SYSTEM_CA_BUNDLE) else None
+
 def _google_translate(text: str, source_lang: str, target_lang: str) -> str:
     params = urllib.parse.urlencode({"client": "dict-chrome-ex", "sl": source_lang, "tl": target_lang, "q": text})
     req = urllib.request.Request(f"https://clients5.google.com/translate_a/t?{params}")
-    context = ssl.create_default_context(cafile=_SYSTEM_CA_BUNDLE) if os.path.exists(_SYSTEM_CA_BUNDLE) else None
-    with urllib.request.urlopen(req, timeout=10, context=context) as resp:
+    with urllib.request.urlopen(req, timeout=10, context=_https_context()) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     return data[0]
+
+# Jisho.org's public JSON API (what jisho.org's own search box calls) — free, no API key.
+# shortcut: only the first, most-relevant entry's senses are used, capped at 3, to keep the
+# Back field readable rather than dumping every sense of a common word.
+def _jisho_lookup(word: str) -> str:
+    params = urllib.parse.urlencode({"keyword": word})
+    req = urllib.request.Request(f"https://jisho.org/api/v1/search/words?{params}")
+    with urllib.request.urlopen(req, timeout=10, context=_https_context()) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    entries = data.get("data") or []
+    if not entries:
+        return ""
+    entry = entries[0]
+    japanese = (entry.get("japanese") or [{}])[0]
+    headword = japanese.get("word") or word
+    reading = japanese.get("reading") or ""
+    lines = [f"{headword} ({reading})" if reading else headword]
+    for i, sense in enumerate(entry.get("senses") or [], start=1):
+        if i > 3:
+            break
+        glosses = "; ".join(sense.get("english_definitions") or [])
+        if not glosses:
+            continue
+        pos = ", ".join(sense.get("parts_of_speech") or [])
+        lines.append(f"{i}. {glosses}" + (f" ({pos})" if pos else ""))
+    return "\n".join(lines)
+
+# Same display names as OCR_LANGUAGE_CODES/TRANSLATE_LANGUAGE_CODES, mapped to Wiktionary's
+# language codes — used for every language except Japanese, which routes to Jisho instead (far
+# better Japanese/English coverage). en.wiktionary.org's own definition API covers every language
+# here directly (tried dictionaryapi.dev first: English-only in practice, every other language's
+# dataset there currently 530s).
+DICTIONARY_LANGUAGE_CODES = {
+    "English": "en",
+    "Spanish": "es",
+    "French": "fr",
+    "German": "de",
+    "Korean": "ko",
+    "Mandarin Chinese": "zh",
+    "Italian": "it",
+    "Portuguese": "pt",
+    "Russian": "ru",
+    "Arabic": "ar",
+}
+
+def _strip_html(text: str) -> str:
+    return html.unescape(re.sub(r"<[^>]+>", "", text)).strip()
+
+# shortcut: only the first 3 definitions (across all parts of speech) are used, to keep the Back
+# field readable rather than dumping every sense of a common word.
+def _wiktionary_lookup(word: str, lang_code: str) -> str:
+    req = urllib.request.Request(
+        f"https://en.wiktionary.org/api/rest_v1/page/definition/{urllib.parse.quote(word, safe='')}"
+    )
+    req.add_header("User-Agent", "decky-anki-cards/0.0.1 (https://github.com/nromanm/decky-anki-cards)")
+    try:
+        with urllib.request.urlopen(req, timeout=10, context=_https_context()) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return ""
+        raise
+    senses = data.get(lang_code) or []
+    if not senses:
+        return ""
+    lines = [word]
+    count = 0
+    for sense_group in senses:
+        pos = sense_group.get("partOfSpeech") or ""
+        for definition in sense_group.get("definitions") or []:
+            text = _strip_html(definition.get("definition") or "")
+            if not text:
+                continue
+            count += 1
+            if count > 3:
+                return "\n".join(lines)
+            lines.append(f"{count}. {text}" + (f" ({pos})" if pos else ""))
+    return "\n".join(lines)
 
 DECK_NAME = "Decky Anki Plugin Deck"
 
 # Builds an AnkiConnect picture/audio media entry from a user-typed path or URL, or None if
 # empty. AnkiConnect distinguishes remote vs local media by which param is set: `url` for
-# http(s), `path` for a local filesystem path (e.g. a file on the Deck itself).
+# http(s), `data` (base64) for a local filesystem path. Confirmed via `flatpak info
+# --show-permissions net.ankiweb.Anki`: its sandbox has no filesystem access outside its own app
+# data, so handing it a host path (e.g. Steam's screenshots dir, or our own /tmp audio extraction)
+# always fails with ENOENT from Anki's side regardless of whether the file genuinely exists —
+# AnkiConnect then writes that raw read error into the field's text instead of failing cleanly.
+# Reading the bytes ourselves (this process isn't sandboxed) and sending them as data sidesteps
+# that entirely; a path that's actually missing on our side is still skipped rather than guessed.
 def _build_media_entry(value: str, field_name: str):
     value = (value or "").strip()
     if not value:
@@ -118,8 +205,12 @@ def _build_media_entry(value: str, field_name: str):
         entry["url"] = value
     else:
         path = os.path.expanduser(value)
+        if not os.path.isfile(path):
+            decky.logger.warning(f"_build_media_entry: {field_name} path {path!r} does not exist, skipping")
+            return None
         filename = os.path.basename(path) or f"decky_{field_name.lower()}"
-        entry["path"] = path
+        with open(path, "rb") as f:
+            entry["data"] = base64.b64encode(f.read()).decode("ascii")
     entry["filename"] = filename
     return entry
 
@@ -375,6 +466,20 @@ class Plugin:
             decky.logger.error(f"translate_text: {e!r}")
             raise Exception(f"Could not reach Google Translate: {e}")
 
+    async def lookup_dictionary(self, word: str, language: str) -> str:
+        loop = asyncio.get_event_loop()
+        if language != "Japanese" and language not in DICTIONARY_LANGUAGE_CODES:
+            raise Exception(f"Dictionary lookup isn't available for {language}.")
+        try:
+            if language == "Japanese":
+                return await loop.run_in_executor(None, _jisho_lookup, word)
+            return await loop.run_in_executor(
+                None, _wiktionary_lookup, word, DICTIONARY_LANGUAGE_CODES[language]
+            )
+        except Exception as e:
+            decky.logger.error(f"lookup_dictionary: {e!r}")
+            raise Exception(f"Could not look up that word: {e}")
+
     # Extracts just the audio track from the most recently saved Steam "Record In Background"
     # clip (Settings > System > Recording must be on, then save a clip with its hotkey) —
     # analogous to the Image field's screenshot capture, but clips aren't exposed through a
@@ -444,6 +549,121 @@ class Plugin:
             decky.logger.info(f"check_anki_connection: not connected: {e}")
             return False
 
+    # One combined readiness check instead of several separate round trips: is Anki even
+    # installed, is AnkiConnect reachable, does the plugin's deck already exist, and does a sync
+    # attempt succeed (folds in "logged into AnkiWeb" and "collection busy" — whatever Anki's own
+    # sync error says, verbatim, covers both without us trying to probe its internals directly).
+    async def check_setup_status(self) -> dict:
+        loop = asyncio.get_event_loop()
+        status = {
+            "anki_installed": False,
+            "anki_connect_reachable": False,
+            "deck_exists": False,
+            "sync_ok": False,
+            "sync_error": "",
+        }
+        status["anki_installed"] = await loop.run_in_executor(
+            None,
+            lambda: subprocess.run(
+                ["flatpak", "info", "net.ankiweb.Anki"], capture_output=True, timeout=5
+            ).returncode == 0,
+        )
+        try:
+            await loop.run_in_executor(None, _ankiconnect_request, "version")
+            status["anki_connect_reachable"] = True
+        except Exception as e:
+            decky.logger.info(f"check_setup_status: AnkiConnect unreachable: {e}")
+            return status
+
+        try:
+            deck_names = await loop.run_in_executor(None, _ankiconnect_request, "deckNames")
+            status["deck_exists"] = DECK_NAME in deck_names
+        except Exception as e:
+            decky.logger.warning(f"check_setup_status: deckNames failed: {e}")
+
+        try:
+            await loop.run_in_executor(None, _ankiconnect_request, "sync")
+            status["sync_ok"] = True
+        except Exception as e:
+            status["sync_error"] = str(e)
+
+        return status
+
+    # Manual trigger for the same best-effort sync add_note already fires after adding a card —
+    # unlike that one, failures here are surfaced to the user instead of just logged, since this
+    # is the user explicitly asking "did it sync?".
+    async def sync_anki(self) -> None:
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(None, _ankiconnect_request, "sync")
+        except Exception as e:
+            decky.logger.error(f"sync_anki: {e}")
+            raise Exception(f"Could not sync: {e}")
+
+    # Best-effort stop of the optional always-on background service (scripts/setup-anki-service.sh)
+    # some users set up for AnkiConnect. Anki enforces a single profile lock, so if that service's
+    # instance is already running, launching Anki another way (the "Open Anki" shortcut) can't get
+    # a usable window — Steam switches focus, finds nothing there, and bounces right back. A no-op
+    # (harmless non-zero exit, swallowed) if the service was never set up or isn't running.
+    async def stop_background_anki(self) -> None:
+        loop = asyncio.get_event_loop()
+
+        def _run():
+            # This backend process's own environment has no XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS
+            # (see CLAUDE.md: Decky runs plugins in a stripped-down environment), which `systemctl
+            # --user` needs to reach the user's systemd instance — without it the command fails
+            # silently (non-zero exit, no exception) and the service is never actually stopped.
+            env = {**os.environ, "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}
+            result = subprocess.run(
+                ["systemctl", "--user", "stop", "anki-background.service"],
+                capture_output=True, timeout=5, env=env,
+            )
+            if result.returncode != 0:
+                decky.logger.info(
+                    f"stop_background_anki: systemctl exited {result.returncode}: "
+                    f"{result.stderr.decode(errors='replace').strip()}"
+                )
+            # `systemctl stop` only tears down the service's own `flatpak run` wrapper, not the
+            # sandboxed Anki process it hands off to — that process is left running, and Anki's own
+            # single-instance D-Bus activation then makes every fresh launch just silently hand off
+            # to it instead of opening its own window ("Already running; reusing existing instance."
+            # in the Steam log), which looks like an instant crash to Steam. Kill the sandbox itself.
+            subprocess.run(["flatpak", "kill", "net.ankiweb.Anki"], capture_output=True, timeout=5, env=env)
+
+        await loop.run_in_executor(None, _run)
+
+    # Manual counterpart to stop_background_anki, for the user to turn the optional always-on
+    # service (scripts/setup-anki-service.sh) back on after using "Open Anki" — no-op (harmless
+    # non-zero exit, swallowed) if it was never set up.
+    async def start_background_anki(self) -> None:
+        loop = asyncio.get_event_loop()
+
+        def _run():
+            env = {**os.environ, "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}
+            result = subprocess.run(
+                ["systemctl", "--user", "start", "anki-background.service"],
+                capture_output=True, timeout=5, env=env,
+            )
+            if result.returncode != 0:
+                decky.logger.info(
+                    f"start_background_anki: systemctl exited {result.returncode}: "
+                    f"{result.stderr.decode(errors='replace').strip()}"
+                )
+
+        await loop.run_in_executor(None, _run)
+
+    async def check_background_anki_status(self) -> bool:
+        loop = asyncio.get_event_loop()
+
+        def _run():
+            env = {**os.environ, "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}
+            result = subprocess.run(
+                ["systemctl", "--user", "is-active", "anki-background.service"],
+                capture_output=True, timeout=5, env=env,
+            )
+            return result.returncode == 0
+
+        return await loop.run_in_executor(None, _run)
 
     async def _ensure_deck_and_model(self, loop, deck_name: str) -> None:
         await loop.run_in_executor(None, _ankiconnect_request, "createDeck", {"deck": deck_name})
@@ -471,6 +691,21 @@ class Plugin:
                         "index": index,
                     })
                     existing_fields.insert(index, field_name)
+
+            # modelFieldAdd only adds the field slot — it never touches the card template, so a
+            # note type from before Example/Translation existed would keep storing that data
+            # (confirmed via notesInfo) without ever displaying it: the old "Card 1" template's
+            # Back HTML simply has no {{Example}}/{{Translation}} placeholder to render. Push the
+            # current template (and styling) every time; harmless no-op if already up to date.
+            await loop.run_in_executor(None, _ankiconnect_request, "updateModelTemplates", {
+                "model": {
+                    "name": NOTE_TYPE_NAME,
+                    "templates": {"Card 1": {"Front": NOTE_TYPE_FRONT_TEMPLATE, "Back": NOTE_TYPE_BACK_TEMPLATE}},
+                },
+            })
+            await loop.run_in_executor(None, _ankiconnect_request, "updateModelStyling", {
+                "model": {"name": NOTE_TYPE_NAME, "css": NOTE_TYPE_CSS},
+            })
 
     # Creates (or reuses, if already present) the plugin's single deck and shared note type.
     # Requires Anki running with AnkiConnect installed.
@@ -517,18 +752,25 @@ class Plugin:
             note_id = await loop.run_in_executor(None, _ankiconnect_request, "addNote", {"note": note})
             decky.logger.info(f"add_note: added note {note_id} to deck {DECK_NAME!r}")
 
-            # AnkiConnect has already copied the image/audio into Anki's own media collection at
-            # this point, so the local source files (if local paths, not URLs) are redundant —
-            # clean them up so they don't pile up on the Deck's storage. The audio path in
-            # particular is always our own extracted temp file (never an arbitrary user path), so
-            # it's always safe to delete.
-            for label, entry in (("image", picture_entry), ("audio", audio_entry)):
-                if entry and "path" in entry:
-                    try:
-                        os.remove(entry["path"])
-                        decky.logger.info(f"add_note: deleted local {label} {entry['path']!r} after upload")
-                    except OSError as e:
-                        decky.logger.warning(f"add_note: could not delete local {label} {entry['path']!r}: {e}")
+            # AnkiConnect has already read and stored the audio data at this point, so the local
+            # temp file is redundant — clean it up so it doesn't pile up on the Deck's storage.
+            # Audio is always our own extracted temp file (never an arbitrary user path), so it's
+            # always safe to delete. The image path, unlike audio, is the user's actual Steam
+            # screenshot (never a copy we made) — never delete that.
+            if audio_entry and os.path.isfile(audio):
+                try:
+                    os.remove(audio)
+                    decky.logger.info(f"add_note: deleted local audio {audio!r} after upload")
+                except OSError as e:
+                    decky.logger.warning(f"add_note: could not delete local audio {audio!r}: {e}")
+
+            # Best-effort: same as pressing Anki's own sync button. Never let a sync failure (not
+            # logged into AnkiWeb, no network, conflict needing manual resolution, ...) mask that
+            # the card itself was already added successfully.
+            try:
+                await loop.run_in_executor(None, _ankiconnect_request, "sync")
+            except Exception as e:
+                decky.logger.warning(f"add_note: sync failed: {e}")
 
             return note_id
         except (urllib.error.URLError, ConnectionError, TimeoutError) as e:

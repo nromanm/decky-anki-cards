@@ -29,6 +29,18 @@ const ocrScreenshot = callable<[path: string, language: string, cropTop: number,
 const createDeck = callable<[], string>("create_deck");
 const addNote = callable<[morph: string, definition: string, example: string, translation: string, image: string, audio: string], number>("add_note");
 const translateText = callable<[text: string, sourceLanguage: string, targetLanguage: string], string>("translate_text");
+const stopBackgroundAnki = callable<[], void>("stop_background_anki");
+const startBackgroundAnki = callable<[], void>("start_background_anki");
+const checkBackgroundAnkiStatus = callable<[], boolean>("check_background_anki_status");
+const syncAnki = callable<[], void>("sync_anki");
+const lookupDictionary = callable<[word: string, language: string], string>("lookup_dictionary");
+const checkSetupStatus = callable<[], {
+  anki_installed: boolean;
+  anki_connect_reachable: boolean;
+  deck_exists: boolean;
+  sync_ok: boolean;
+  sync_error: string;
+}>("check_setup_status");
 
 const DECK_NAME = "Decky Anki Plugin Deck";
 
@@ -47,6 +59,12 @@ const LANGUAGE_OPTIONS = [
 // launchers use (a non-Steam-game shortcut + RunGame). Tradeoff: this does switch focus away
 // from the current game (gamescope can only focus one app at a time), but the game keeps running
 // and switching back is quick.
+//
+// Steam's own flatpak-aware shortcut creator (InstallFlatpakAppAndCreateShortcut) was tried next,
+// to get Anki's FlatpakAppID set correctly — but it runs an "ensure installed" flatpak command
+// internally, which hits an interactive remote-choice prompt ("flathub found in multiple
+// installations: system/user") on setups with both a system and a user flathub remote, and just
+// aborts (appid 0) with no interactive terminal to answer it. Back to the plain version.
 const ANKI_FLATPAK_EXE = "/usr/bin/flatpak";
 const ANKI_FLATPAK_LAUNCH_OPTIONS = "run net.ankiweb.Anki";
 
@@ -68,10 +86,20 @@ async function ensureAnkiShortcut(): Promise<number> {
 }
 
 async function launchAnki(): Promise<void> {
+  // Confirmed (don't remove this): skipping this kill leaves the background service's existing
+  // instance alive, and Anki's own single-instance D-Bus activation just silently hands off to it
+  // instead of opening a new window — Steam's shortcut-launched process exits almost immediately
+  // either way, so there's no way to "raise" the existing headless instance's window this way.
+  await stopBackgroundAnki().catch((e) => console.error("[AnkiCards] stopBackgroundAnki failed:", e));
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+
   const appId = await ensureAnkiShortcut();
   // Give Steam a moment to register the shortcut's exe/launch options before running it.
-  await new Promise((resolve) => setTimeout(resolve, 500));
-  const overview = window.appStore.GetAppOverviewByAppID(appId);
+  let overview = null;
+  for (let attempt = 0; attempt < 10 && !overview; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    overview = window.appStore.GetAppOverviewByAppID(appId);
+  }
   if (!overview) {
     throw new Error("Could not resolve the Anki shortcut after creating it.");
   }
@@ -120,6 +148,36 @@ const cache = {
   cropEnabled: false,
 };
 
+// Decky wraps every backend (Python) exception as a JS Error whose .message is just the generic
+// "Python Exception" — the actual message (e.g. "Could not reach Google Translate: ...") only
+// shows up as the last line of .stack, after the embedded Python traceback. Toasts built from
+// String(e) alone were showing that useless generic text; this pulls out the real one.
+function describeError(e: unknown): string {
+  const stack = e && typeof e === "object" && "stack" in e ? String((e as { stack: unknown }).stack) : "";
+  const lines = stack.trim().split("\n");
+  const lastLine = lines[lines.length - 1] ?? "";
+  const match = lastLine.match(/^\w*(?:Error|Exception):\s*(.+)$/);
+  return match ? match[1] : String(e);
+}
+
+// One-level undo for auto-filled fields (Look Up -> Back, OCR -> Example, Translate ->
+// Translation) — lets the user get back whatever was there before an auto-fill if they don't like
+// the result, without a full history stack.
+function useFieldBackup(value: string, setValue: (v: string) => void) {
+  const [backup, setBackup] = useState<string | null>(null);
+  return {
+    hasBackup: backup !== null,
+    stash: () => setBackup(value),
+    undo: () => {
+      if (backup !== null) {
+        setValue(backup);
+        setBackup(null);
+      }
+    },
+    clear: () => setBackup(null),
+  };
+}
+
 function Content() {
   const [morph, setMorphState] = useState(cache.morph);
   const [definition, setDefinitionState] = useState(cache.definition);
@@ -146,6 +204,18 @@ function Content() {
   const [ankiStatus, setAnkiStatus] = useState<"unknown" | "connected" | "disconnected">("unknown");
   const [isCheckingStatus, setIsCheckingStatus] = useState(false);
   const [isLaunchingAnki, setIsLaunchingAnki] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [isTogglingBackgroundAnki, setIsTogglingBackgroundAnki] = useState(false);
+  const [isBackgroundAnkiActive, setIsBackgroundAnkiActive] = useState<boolean | null>(null);
+  const [isLookingUpDictionary, setIsLookingUpDictionary] = useState(false);
+  const [setupStatus, setSetupStatus] = useState<{
+    anki_installed: boolean;
+    anki_connect_reachable: boolean;
+    deck_exists: boolean;
+    sync_ok: boolean;
+    sync_error: string;
+  } | null>(null);
+  const [isCheckingSetup, setIsCheckingSetup] = useState(false);
 
   const onCheckAnkiStatus = () => {
     setIsCheckingStatus(true);
@@ -158,10 +228,26 @@ function Content() {
       .finally(() => setIsCheckingStatus(false));
   };
 
+  const onCheckBackgroundAnkiStatus = () => {
+    checkBackgroundAnkiStatus()
+      .then((active) => setIsBackgroundAnkiActive(active))
+      .catch((e) => console.error("[AnkiCards] checkBackgroundAnkiStatus failed:", e));
+  };
+
+  const onCheckSetupStatus = () => {
+    setIsCheckingSetup(true);
+    checkSetupStatus()
+      .then((status) => setSetupStatus(status))
+      .catch((e) => console.error("[AnkiCards] checkSetupStatus failed:", e))
+      .finally(() => setIsCheckingSetup(false));
+  };
+
   // Refresh status whenever this tab (re)mounts, including the QAM's remount-on-dropdown-close
   // quirk — harmless here since it's just a read-only refresh, not something that resets input.
   useEffect(() => {
     onCheckAnkiStatus();
+    onCheckBackgroundAnkiStatus();
+    onCheckSetupStatus();
   }, []);
 
   const onOpenAnki = () => {
@@ -169,9 +255,73 @@ function Content() {
     launchAnki()
       .catch((e) => {
         console.error("[AnkiCards] launchAnki failed:", e);
-        toaster.toast({ title: "Could not open Anki", body: String(e) });
+        toaster.toast({ title: "Could not open Anki", body: describeError(e) });
       })
-      .finally(() => setIsLaunchingAnki(false));
+      .finally(() => {
+        setIsLaunchingAnki(false);
+        onCheckBackgroundAnkiStatus(); // launchAnki() stops the background service as a side effect
+      });
+  };
+
+  // Manual controls for the optional always-on background service (scripts/setup-anki-service.sh)
+  // — "Open Anki" already stops it automatically before launching (Anki only allows one running
+  // instance at a time), so this lets the user turn it back on afterward instead of waiting for
+  // the next Gaming Mode boot, or turn it off without also opening a window.
+  const onStartBackgroundAnki = () => {
+    setIsTogglingBackgroundAnki(true);
+    startBackgroundAnki()
+      .then(() => toaster.toast({ title: "Background Anki started", body: "AnkiConnect should be reachable shortly." }))
+      .catch((e) => {
+        console.error("[AnkiCards] startBackgroundAnki failed:", e);
+        toaster.toast({ title: "Could not start background Anki", body: describeError(e) });
+      })
+      .finally(() => {
+        setIsTogglingBackgroundAnki(false);
+        onCheckBackgroundAnkiStatus();
+      });
+  };
+
+  const onStopBackgroundAnki = () => {
+    setIsTogglingBackgroundAnki(true);
+    stopBackgroundAnki()
+      .then(() => toaster.toast({ title: "Background Anki stopped", body: "" }))
+      .catch((e) => {
+        console.error("[AnkiCards] stopBackgroundAnki failed:", e);
+        toaster.toast({ title: "Could not stop background Anki", body: describeError(e) });
+      })
+      .finally(() => {
+        setIsTogglingBackgroundAnki(false);
+        onCheckBackgroundAnkiStatus();
+      });
+  };
+
+  const onSyncAnki = () => {
+    setIsSyncing(true);
+    syncAnki()
+      .then(() => toaster.toast({ title: "Synced", body: "" }))
+      .catch((e) => {
+        console.error("[AnkiCards] syncAnki failed:", e);
+        toaster.toast({ title: "Could not sync", body: describeError(e) });
+      })
+      .finally(() => setIsSyncing(false));
+  };
+
+  const onLookupDictionary = () => {
+    setIsLookingUpDictionary(true);
+    lookupDictionary(morph, originLanguage)
+      .then((text) => {
+        definitionUndo.stash();
+        setDefinition(text);
+        toaster.toast({
+          title: text ? "Dictionary entry found" : "No entry found",
+          body: text ? text.slice(0, 80) : `Jisho has no entry for "${morph}".`,
+        });
+      })
+      .catch((e) => {
+        console.error("[AnkiCards] lookupDictionary failed:", e);
+        toaster.toast({ title: "Could not look up that word", body: describeError(e) });
+      })
+      .finally(() => setIsLookingUpDictionary(false));
   };
 
   const onTakeScreenshot = () => {
@@ -184,7 +334,7 @@ function Content() {
       .then((previewUrl) => setImagePreviewUrl(previewUrl))
       .catch((e) => {
         console.error("[AnkiCards] onTakeScreenshot failed:", e);
-        toaster.toast({ title: "Could not get last screenshot", body: String(e) });
+        toaster.toast({ title: "Could not get last screenshot", body: describeError(e) });
       })
       .finally(() => setIsLoadingScreenshot(false));
   };
@@ -207,6 +357,7 @@ function Content() {
     )
       .then((text) => {
         console.log("[AnkiCards] onRunOcr: result:", JSON.stringify(text));
+        exampleUndo.stash();
         setExample(text);
         toaster.toast({
           title: text ? "OCR done" : "No text found",
@@ -215,7 +366,7 @@ function Content() {
       })
       .catch((e) => {
         console.error("[AnkiCards] ocrScreenshot failed:", e);
-        toaster.toast({ title: "Could not read text from image", body: String(e) });
+        toaster.toast({ title: "Could not read text from image", body: describeError(e) });
       })
       .finally(() => setIsRunningOcr(false));
   };
@@ -223,10 +374,13 @@ function Content() {
   const onTranslate = () => {
     setIsTranslating(true);
     translateText(example, originLanguage, targetLanguage)
-      .then((text) => setTranslation(text))
+      .then((text) => {
+        translationUndo.stash();
+        setTranslation(text);
+      })
       .catch((e) => {
         console.error("[AnkiCards] translateText failed:", e);
-        toaster.toast({ title: "Could not translate", body: String(e) });
+        toaster.toast({ title: "Could not translate", body: describeError(e) });
       })
       .finally(() => setIsTranslating(false));
   };
@@ -255,7 +409,7 @@ function Content() {
       .then((previewUrl) => setAudioPreviewUrl(previewUrl))
       .catch((e) => {
         console.error("[AnkiCards] onTakeAudio failed:", e);
-        toaster.toast({ title: "Could not get recording audio", body: String(e) });
+        toaster.toast({ title: "Could not get recording audio", body: describeError(e) });
       })
       .finally(() => setIsLoadingAudio(false));
   };
@@ -283,6 +437,9 @@ function Content() {
     cache.translation = value;
     setTranslationState(value);
   };
+  const definitionUndo = useFieldBackup(definition, setDefinition);
+  const exampleUndo = useFieldBackup(example, setExample);
+  const translationUndo = useFieldBackup(translation, setTranslation);
   const setOriginLanguage = (value: string) => {
     cache.originLanguage = value;
     setOriginLanguageState(value);
@@ -354,9 +511,12 @@ function Content() {
       })
       .catch((e) => {
         console.error("[AnkiCards] create_deck failed:", e);
-        toaster.toast({ title: "Could not create deck", body: String(e) });
+        toaster.toast({ title: "Could not create deck", body: describeError(e) });
       })
-      .finally(() => setIsCreatingDeck(false));
+      .finally(() => {
+        setIsCreatingDeck(false);
+        onCheckSetupStatus();
+      });
   };
 
   const onAddCard = () => {
@@ -373,16 +533,47 @@ function Content() {
         setAudio("");
         setAudioPreviewUrl("");
         setAudioDuration(null);
+        definitionUndo.clear();
+        exampleUndo.clear();
+        translationUndo.clear();
       })
       .catch((e) => {
         console.error("[AnkiCards] add_note failed:", e);
-        toaster.toast({ title: "Could not add card", body: String(e) });
+        toaster.toast({ title: "Could not add card", body: describeError(e) });
       })
-      .finally(() => setIsAddingCard(false));
+      .finally(() => {
+        setIsAddingCard(false);
+        onCheckSetupStatus();
+      });
   };
 
   const ankiStatusGlyph = ankiStatus === "connected" ? "✓" : ankiStatus === "disconnected" ? "✗" : "…";
   const ankiStatusColor = ankiStatus === "connected" ? "#2ecc71" : ankiStatus === "disconnected" ? "#e74c3c" : "#888";
+
+  // Same circular colored-glyph badge as the AnkiConnect status row, reused for every other
+  // readiness check so they all read the same way at a glance.
+  const statusBadge = (glyph: string, color: string) => (
+    <span
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        width: "20px",
+        height: "20px",
+        borderRadius: "50%",
+        backgroundColor: color,
+        color: "white",
+        fontSize: "12px",
+        lineHeight: 1,
+      }}
+    >
+      {glyph}
+    </span>
+  );
+
+  // true/false/null (not yet known, or not checkable without AnkiConnect) -> glyph + color.
+  const tristateBadge = (value: boolean | null) =>
+    value === null ? statusBadge("…", "#888") : value ? statusBadge("✓", "#2ecc71") : statusBadge("✗", "#e74c3c");
 
   const compactButtonStyle = { flex: 1, minWidth: 0, fontSize: "12px", padding: "6px 4px" };
 
@@ -396,30 +587,38 @@ function Content() {
     <>
     <PanelSection title="Anki Status">
       <PanelSectionRow>
-        <Field label="AnkiConnect">
-          <span
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              justifyContent: "center",
-              width: "20px",
-              height: "20px",
-              borderRadius: "50%",
-              backgroundColor: ankiStatusColor,
-              color: "white",
-              fontSize: "12px",
-              lineHeight: 1,
-            }}
-          >
-            {ankiStatusGlyph}
-          </span>
+        <Field label="AnkiConnect">{statusBadge(ankiStatusGlyph, ankiStatusColor)}</Field>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <Field label="Anki installed">
+          {tristateBadge(setupStatus ? setupStatus.anki_installed : null)}
         </Field>
       </PanelSectionRow>
       <PanelSectionRow>
+        <Field label="Deck created">
+          {tristateBadge(!setupStatus || !setupStatus.anki_connect_reachable ? null : setupStatus.deck_exists)}
+        </Field>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <Field label="Sync">
+          {tristateBadge(!setupStatus || !setupStatus.anki_connect_reachable ? null : setupStatus.sync_ok)}
+        </Field>
+      </PanelSectionRow>
+      {setupStatus && setupStatus.anki_connect_reachable && !setupStatus.sync_ok && setupStatus.sync_error && (
+        <PanelSectionRow>
+          <div style={{ fontSize: "11px", opacity: 0.6, padding: "2px 0" }}>
+            {setupStatus.sync_error}
+          </div>
+        </PanelSectionRow>
+      )}
+      <PanelSectionRow>
         <ButtonItem
           layout="below"
-          disabled={isCheckingStatus}
-          onClick={onCheckAnkiStatus}
+          disabled={isCheckingStatus || isCheckingSetup}
+          onClick={() => {
+            onCheckAnkiStatus();
+            onCheckSetupStatus();
+          }}
         >
           Check Status
         </ButtonItem>
@@ -429,7 +628,7 @@ function Content() {
       <PanelSectionRow>
         <ButtonItem
           layout="below"
-          disabled={isLaunchingAnki}
+          disabled={isLaunchingAnki || isBackgroundAnkiActive === true}
           onClick={onOpenAnki}
         >
           Open Anki
@@ -437,42 +636,68 @@ function Content() {
       </PanelSectionRow>
       <PanelSectionRow>
         <div style={{ fontSize: "11px", opacity: 0.6, padding: "2px 0" }}>
-          Opens Anki in a second window, switching away from your game.
+          Opens Anki in a second window, switching away from your game. Disabled while the
+          background service below is running — stop it first (Anki only allows one instance).
         </div>
-      </PanelSectionRow>
-    </PanelSection>
-    <PanelSection title="New Card">
-      <PanelSectionRow>
-        <Field label="Deck">{DECK_NAME}</Field>
       </PanelSectionRow>
       <PanelSectionRow>
         <ButtonItem
           layout="below"
-          disabled={isCreatingDeck}
-          onClick={onCreateDeck}
+          disabled={isSyncing}
+          onClick={onSyncAnki}
         >
-          Create Deck
+          Sync Now
         </ButtonItem>
       </PanelSectionRow>
-      {divider}
       <PanelSectionRow>
-        <TextField
-          label="Front *"
-          value={morph}
-          onChange={(e) => setMorph(e.target.value)}
-        />
+        <div style={{ fontSize: "11px", opacity: 0.6, padding: "2px 0" }}>
+          Forces an AnkiWeb sync (same as Anki's own sync button) — requires AnkiConnect
+          reachable and the profile already logged into AnkiWeb.
+        </div>
       </PanelSectionRow>
-      {divider}
       <PanelSectionRow>
-        <TextField
-          label="Back"
-          value={definition}
-          onChange={(e) => setDefinition(e.target.value)}
-        />
+        <Focusable style={{ display: "flex", gap: "8px" }}>
+          <DialogButton
+            disabled={isTogglingBackgroundAnki || isBackgroundAnkiActive === true}
+            onClick={onStartBackgroundAnki}
+            style={compactButtonStyle}
+          >
+            Start Background
+          </DialogButton>
+          <DialogButton
+            disabled={isTogglingBackgroundAnki || isBackgroundAnkiActive === false}
+            onClick={onStopBackgroundAnki}
+            style={compactButtonStyle}
+          >
+            Stop Background
+          </DialogButton>
+        </Focusable>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <div style={{ fontSize: "11px", opacity: 0.6, padding: "2px 0" }}>
+          Controls the optional always-on background service (set up once via
+          scripts/setup-anki-service.sh) — keeps AnkiConnect reachable without opening a window.
+        </div>
       </PanelSectionRow>
     </PanelSection>
-    <PanelSection title="Image & Example">
-      {divider}
+    <PanelSection title="New Card">
+      {!setupStatus?.deck_exists && (
+        <>
+          <PanelSectionRow>
+            <Field label="Deck">{DECK_NAME}</Field>
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <ButtonItem
+              layout="below"
+              disabled={isCreatingDeck}
+              onClick={onCreateDeck}
+            >
+              Create Deck
+            </ButtonItem>
+          </PanelSectionRow>
+          {divider}
+        </>
+      )}
       <PanelSectionRow>
         <Focusable style={{ display: "flex", gap: "8px" }}>
           <div style={{ flex: 1 }}>
@@ -493,6 +718,64 @@ function Content() {
           </div>
         </Focusable>
       </PanelSectionRow>
+      {divider}
+      <PanelSectionRow>
+        <TextField
+          label="Front *"
+          value={morph}
+          onChange={(e) => setMorph(e.target.value)}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <div style={{ fontSize: "11px", opacity: 0.6, padding: "2px 0" }}>
+          To copy text between fields: long-press the touchpad to select words, then press Copy.
+          To paste, long-press again and press Paste.
+        </div>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <Focusable style={{ display: "flex", gap: "8px" }}>
+          <DialogButton
+            disabled={!morph || isLookingUpDictionary}
+            onClick={onLookupDictionary}
+            style={compactButtonStyle}
+          >
+            Look Up ({originLanguage === "Japanese" ? "Jisho" : "Wiktionary"})
+          </DialogButton>
+          <DialogButton
+            disabled={!definitionUndo.hasBackup}
+            onClick={definitionUndo.undo}
+            style={compactButtonStyle}
+          >
+            Undo
+          </DialogButton>
+        </Focusable>
+      </PanelSectionRow>
+      {divider}
+      <PanelSectionRow>
+        <div style={{ fontSize: "14px", marginBottom: "4px" }}>Back</div>
+        <textarea
+          value={definition}
+          onChange={(e) => setDefinition(e.target.value)}
+          rows={5}
+          style={{
+            width: "100%",
+            minHeight: "110px",
+            resize: "vertical",
+            fontFamily: "inherit",
+            fontSize: "13px",
+            lineHeight: 1.4,
+            padding: "8px",
+            boxSizing: "border-box",
+            background: "rgba(255,255,255,0.05)",
+            color: "inherit",
+            border: "1px solid rgba(255,255,255,0.2)",
+            borderRadius: "4px",
+          }}
+        />
+      </PanelSectionRow>
+    </PanelSection>
+    <PanelSection title="Image & Example">
+      {divider}
       {imagePreviewUrl && (
         <PanelSectionRow>
           <div style={{ position: "relative" }}>
@@ -598,13 +881,22 @@ function Content() {
         </>
       )}
       <PanelSectionRow>
-        <DialogButton
-          disabled={!image || isRunningOcr}
-          onClick={onRunOcr}
-          style={compactButtonStyle}
-        >
-          OCR from Image
-        </DialogButton>
+        <Focusable style={{ display: "flex", gap: "8px" }}>
+          <DialogButton
+            disabled={!image || isRunningOcr}
+            onClick={onRunOcr}
+            style={compactButtonStyle}
+          >
+            OCR from Image
+          </DialogButton>
+          <DialogButton
+            disabled={!exampleUndo.hasBackup}
+            onClick={exampleUndo.undo}
+            style={compactButtonStyle}
+          >
+            Undo
+          </DialogButton>
+        </Focusable>
       </PanelSectionRow>
       <PanelSectionRow>
         <div style={{ fontSize: "11px", opacity: 0.6, padding: "2px 0" }}>
@@ -633,15 +925,25 @@ function Content() {
           }}
         />
       </PanelSectionRow>
-      {divider}
+    </PanelSection>
+    <PanelSection title="Translation">
       <PanelSectionRow>
-        <DialogButton
-          disabled={!example || isTranslating}
-          onClick={onTranslate}
-          style={compactButtonStyle}
-        >
-          Translate
-        </DialogButton>
+        <Focusable style={{ display: "flex", gap: "8px" }}>
+          <DialogButton
+            disabled={!example || isTranslating}
+            onClick={onTranslate}
+            style={compactButtonStyle}
+          >
+            Translate
+          </DialogButton>
+          <DialogButton
+            disabled={!translationUndo.hasBackup}
+            onClick={translationUndo.undo}
+            style={compactButtonStyle}
+          >
+            Undo
+          </DialogButton>
+        </Focusable>
       </PanelSectionRow>
       <PanelSectionRow>
         <div style={{ fontSize: "14px", marginBottom: "4px" }}>Translation</div>
